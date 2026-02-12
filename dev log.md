@@ -52,3 +52,9 @@
 ## 2/6/2026
 - working today on the schemas for the system
 
+## 2/12/2026 
+- didn't really log the last few days, but worked on the schemas some more and refined them down
+- made some functions to serialize the schema, save, and retrieve it
+- using pydantic to make sure the schemas are enforced, rather than just placeholders
+- found out what the -> after a function does, apparently it's just meta data??
+
