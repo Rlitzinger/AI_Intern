@@ -58,3 +58,12 @@
 - using pydantic to make sure the schemas are enforced, rather than just placeholders
 - found out what the -> after a function does, apparently it's just meta data??
 - created the ollama call and was able to generate a plan from that (and track tokens etc.)
+
+# 2/15/2026
+- designed the coding agent today
+- it's able to take in a task from the plan and make code
+- also updated the planning agent to not dissect simple tasks into like 5 steps
+    - for ex. reading the number of rows from a .csv was loading in pandas, then a helper function to load the table, then another function to read ...
+    - now it is a little more refined to just one step for this stuf
+- important note for later: if the function brings in some libraries make sure that they are installed via pip, or give instructions not to use 3rd party libs
+- You have a minimum verticle slice!!! you can write a plan, generate a plan with tasks, and generate code against those tasks!!

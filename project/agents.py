@@ -12,7 +12,7 @@ class PlanningAgent:
 
 Your job:
 - Analyze the user's request
-- Create 2-5 specific, ordered tasks
+- Create 1-3 specific, ordered tasks
 - Each task must be clear and measurable
 - Tasks should build on each other logically
 
@@ -24,7 +24,19 @@ Return valid JSON matching the provided structure exactly."""
         return f"""User Request:
 "{request.content}"
 
-Create a plan to accomplish this request.
+Analyze this request and create an appropriate plan.
+
+PLANNING PRINCIPLES:
+- If the request asks for "a function" or "a script", that's usually 1 task
+- Don't break simple requests into unnecessary steps
+- Each task should be independently executable code
+- Avoid meta-tasks like "install library" or "set up environment"
+- Focus on what code artifacts need to be created
+
+Examples:
+- "Write a function to X" → 1 task: "Write function that does X"
+- "Create a script that does X and Y" → 2 tasks: "Write code for X", "Write code for Y"
+- "Build a web scraper" → 2-3 tasks: "Write scraping function", "Write storage function", "Write main script"
 
 Return JSON with this EXACT structure:
 {{
@@ -33,24 +45,19 @@ Return JSON with this EXACT structure:
         {{
             "plan_id": "placeholder",
             "task_order": 0,
-            "goal": "First specific task description"
-        }},
-        {{
-            "plan_id": "placeholder",
-            "task_order": 1,
-            "goal": "Second specific task description"
+            "goal": "Write a function/script that..."
         }}
     ]
 }}
 
 CRITICAL RULES:
 1. task_order starts at 0 and increments by 1
-2. Each goal must be specific and actionable
-3. Include 2-5 tasks only
-4. Use "placeholder" for plan_id (will be auto-generated)
-5. Return ONLY the JSON object, no explanatory text
+2. Each goal must describe a CODE ARTIFACT to create
+3. Include 1-3 tasks (prefer fewer for simple requests)
+4. Use "placeholder" for plan_id
+5. Return ONLY the JSON object
 
-Focus on breaking down the request into concrete, implementable steps."""
+For this request, what code files/functions need to be written?"""
     
     @classmethod
     def create_plan(cls, request: RequestSchema) -> PlanSchema:
@@ -82,6 +89,7 @@ Focus on breaking down the request into concrete, implementable steps."""
         
         return plan
     
+
 class CodingAgent:
     """Coding agent that generates Python code for tasks."""
     
