@@ -57,4 +57,4 @@
 - made some functions to serialize the schema, save, and retrieve it
 - using pydantic to make sure the schemas are enforced, rather than just placeholders
 - found out what the -> after a function does, apparently it's just meta data??
-
+- created the ollama call and was able to generate a plan from that (and track tokens etc.)

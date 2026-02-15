@@ -19,7 +19,7 @@ class TaskSchema(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = None
     schema_version: str = "0.0.1"
-    result: Optional[str] = None
+    result: Optional[str] = None  # ← Generated code goes here
     error_message: Optional[str] = None
 
 class PlanSchema(BaseModel):
@@ -31,3 +31,4 @@ class PlanSchema(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = None
     schema_version: str = "0.0.1"
+    token_usage: int = 0

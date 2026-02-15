@@ -49,14 +49,15 @@ This is the minimal vertical slice needed to run a multi agent system. A simple 
 - [X] Create the claude.md file
 - [X] Create a daily devlog file
 - [X] Create the project structure
-- [] Design the data schemas
+- [X] Design the data schemas
 
 ## Current State
-- [ ] Schemas defined
-- [ ] LLM wrapper working
-- [ ] Planning agent implemented
+- [X] Schemas defined
+- [X] LLM wrapper working
+- [X] Planning agent implemented
 - [ ] Executor implemented (stub)
-- [ ] Coding agent implemented
+- [X] Coding agent implemented
 - [ ] Validation implemented (stub)
 - [ ] SQLite storage working
 - [ ] End-to-end flow tested
+- [ ] Add function around coding output to install libraries if imported
