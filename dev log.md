@@ -67,3 +67,5 @@
     - now it is a little more refined to just one step for this stuf
 - important note for later: if the function brings in some libraries make sure that they are installed via pip, or give instructions not to use 3rd party libs
 - You have a minimum verticle slice!!! you can write a plan, generate a plan with tasks, and generate code against those tasks!!
+- added a validation agent that checks out if the code agent returned good code
+- stripped example usage from the code agent output mechanically bc it wouldnt follow directions well. 

@@ -1,5 +1,5 @@
 from schemas import RequestSchema, PlanSchema, TaskSchema
-from agents import PlanningAgent, CodingAgent
+from agents import PlanningAgent, CodingAgent, ValidationAgent
 import sqlite3
 import json
 
@@ -66,12 +66,12 @@ def load_plan_from_sqlite(plan_id: str) -> PlanSchema:
 
 # FULL PIPELINE TEST
 if __name__ == "__main__":
-    print("=" * 70)
-    print("🚀 FULL PIPELINE: REQUEST → PLANNING → EXECUTION")
-    print("=" * 70)
+    print("=" * 80)
+    print("🚀 FULL PIPELINE: REQUEST → PLANNING → EXECUTION → VALIDATION")
+    print("=" * 80)
     
     # === STEP 1: USER INPUT ===
-    user_input = "Create a Python function that reads a CSV file and counts the number of rows"
+    user_input = "Write a Python function that calculates the Fibonacci sequence up to n terms"
     request = RequestSchema(content=user_input)
     print(f"\n📨 Step 1: User Request")
     print(f"   Request ID: {request.request_id}")
@@ -81,7 +81,7 @@ if __name__ == "__main__":
     print(f"\n📋 Step 2: Planning Agent")
     plan = PlanningAgent.create_plan(request)
     
-    print(f"\n   Generated {len(plan.tasks)} tasks:")
+    print(f"\n   Generated {len(plan.tasks)} task(s):")
     for i, task in enumerate(plan.tasks):
         print(f"   [{i}] {task.goal}")
     
@@ -104,45 +104,64 @@ if __name__ == "__main__":
         # Update the task in the plan
         plan.tasks[i] = updated_task
         
-        print(f"   Status: {updated_task.status}")
+        print(f"   Status after execution: {updated_task.status}")
         print(f"   Code length: {len(updated_task.result)} chars")
         print(f"   Tokens: {tokens}")
     
-    # Update plan status and token usage
-    plan.status = "executing"  # Will be "complete" after validation
     plan.token_usage += total_execution_tokens
+    plan.status = "executing"
     
-    # Save plan after execution
+    # Save after execution
     save_plan_to_sqlite(plan)
     
-    # === STEP 4: VERIFICATION ===
-    print(f"\n✅ Step 4: Verification")
+    # === STEP 4: VALIDATION ===
+    print(f"\n🔍 Step 4: Validating Tasks")
+    
+    for i, task in enumerate(plan.tasks):
+        print(f"\n   --- Task {i} ---")
+        
+        # Validate with ValidationAgent
+        validated_task = ValidationAgent.validate_task(task)
+        
+        # Update the task in the plan
+        plan.tasks[i] = validated_task
+        
+        print(f"   Final status: {validated_task.status}")
+        if validated_task.error_message:
+            print(f"   Error: {validated_task.error_message}")
+    
+    # Update plan status based on task results
+    all_validated = all(t.status == "validated" for t in plan.tasks)
+    any_failed = any(t.status == "failed" for t in plan.tasks)
+    
+    if all_validated:
+        plan.status = "complete"
+    elif any_failed:
+        plan.status = "failed"
+    else:
+        plan.status = "validating"
+    
+    # Save after validation
+    save_plan_to_sqlite(plan)
+    
+    # === STEP 5: SUMMARY ===
+    print(f"\n📊 Step 5: Summary")
     loaded_plan = load_plan_from_sqlite(plan.plan_id)
     
+    validated_count = sum(1 for t in loaded_plan.tasks if t.status == "validated")
+    failed_count = sum(1 for t in loaded_plan.tasks if t.status == "failed")
+    
     print(f"   Plan ID: {loaded_plan.plan_id}")
-    print(f"   Status: {loaded_plan.status}")
+    print(f"   Plan Status: {loaded_plan.status}")
     print(f"   Total tokens: {loaded_plan.token_usage}")
-    print(f"   Tasks completed: {sum(1 for t in loaded_plan.tasks if t.status == 'complete')}/{len(loaded_plan.tasks)}")
+    print(f"   Tasks validated: {validated_count}/{len(loaded_plan.tasks)}")
+    print(f"   Tasks failed: {failed_count}/{len(loaded_plan.tasks)}")
     
-    # Show generated code for each task
-    print(f"\n📝 Generated Code Summary:")
-    for i, task in enumerate(loaded_plan.tasks):
-        print(f"\n   Task {i}: {task.goal[:60]}...")
-        print(f"   Status: {task.status}")
-        if task.result:
-            lines = task.result.split('\n')
-            print(f"   Code preview (first 5 lines):")
-            for line in lines[:5]:
-                print(f"      {line}")
-            if len(lines) > 5:
-                print(f"      ... ({len(lines) - 5} more lines)")
+    print(f"\n" + "=" * 80)
+    if plan.status == "complete":
+        print("🎉 FULL PIPELINE SUCCESSFUL!")
+    else:
+        print("⚠️  PIPELINE COMPLETED WITH ISSUES")
+    print("=" * 80)
     
-    print(f"\n" + "=" * 70)
-    print("🎉 FULL PIPELINE SUCCESSFUL!")
-    print("=" * 70)
-    print(f"\nSummary:")
-    print(f"  • Request processed: {request.request_id}")
-    print(f"  • Plan created: {plan.plan_id}")
-    print(f"  • Tasks executed: {len(plan.tasks)}")
-    print(f"  • Total tokens used: {plan.token_usage}")
-    print(f"  • All data persisted to SQLite")
+    print(f"\nNext step: Run 'python inspect_results.py' to see generated code")

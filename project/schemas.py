@@ -14,7 +14,7 @@ class TaskSchema(BaseModel):
     plan_id: str
     task_order: int
     goal: str
-    status: Literal["pending", "executing", "validating", "complete", "failed"] = "pending"
+    status: Literal["pending", "executing", "validating", "complete", "validated", "failed"] = "pending"
     retry_count: int = 0
     created_at: datetime = Field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = None
