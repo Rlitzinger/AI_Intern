@@ -66,6 +66,16 @@ def inspect_latest_plan():
             print(f"  - Lines: {len(task['result'].splitlines())} lines")
         else:
             print("\n⚠️  No code generated for this task")
+
+        if task.get('test_code'):
+            print(f"\n{'▼' * 40} TESTS {'▼' * 40}")
+            print(task['test_code'])
+            print(f"{'▲' * 40} END {'▲' * 40}")
+            print(f"\nTest Stats:")
+            print(f"  - Length: {len(task['test_code'])} characters")
+            print(f"  - Lines: {len(task['test_code'].splitlines())} lines")
+        else:
+            print("\n⚠️  No tests generated for this task")
     
     print("\n" + "=" * 80)
 

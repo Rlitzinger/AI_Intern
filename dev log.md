@@ -69,3 +69,11 @@
 - You have a minimum verticle slice!!! you can write a plan, generate a plan with tasks, and generate code against those tasks!!
 - added a validation agent that checks out if the code agent returned good code
 - stripped example usage from the code agent output mechanically bc it wouldnt follow directions well. 
+
+# 2/16/2026
+- excited to code today, was thinking of more multi-level hierarchies and a mechanism to determine how deep into hierarchial decomp is needed, or when to just one-shot requests if they are simple enough
+- work today is to make a better validator (compiles code, improves quality, maake sure it works), then an orchestration for error recovery and retry, then a task router.
+- added in a better validator that runs a test over the code to make sure it works as intended, improved this, now it runs multiple self-generated tests and stores the output in the db
+- about to work on orchestrator > should replace the whole main.py calls and run through all of it itself.
+    - orchestrator works! able to retry errors as well on the coding agent if test don't pass.
+
