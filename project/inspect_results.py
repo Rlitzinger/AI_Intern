@@ -61,7 +61,7 @@ def inspect_latest_plan():
             print(f"\n{'▼' * 40} CODE {'▼' * 40}")
             print(task['result'])
             print(f"{'▲' * 40} END {'▲' * 40}")
-            print(f"\nCode Stats:")
+            print(f"\Stats:")
             print(f"  - Length: {len(task['result'])} characters")
             print(f"  - Lines: {len(task['result'].splitlines())} lines")
         else:

@@ -76,4 +76,8 @@
 - added in a better validator that runs a test over the code to make sure it works as intended, improved this, now it runs multiple self-generated tests and stores the output in the db
 - about to work on orchestrator > should replace the whole main.py calls and run through all of it itself.
     - orchestrator works! able to retry errors as well on the coding agent if test don't pass.
-
+- created task router that delegates based on keywords
+    - able to identify which agent to pass info to
+-  working on updating the validation engine to be able to spin up local server code to test (like flask django)
+    - having issues with the server not spinning up and there being bad tests
+- was able to create a harnass that executes servers, and sends/receives info from them

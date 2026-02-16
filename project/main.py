@@ -3,28 +3,24 @@ from agents import PlanningAgent, CodingAgent, ValidationAgent, Orchestrator
 import sqlite3
 import json
 
+# main.py - should work exactly like before
 if __name__ == "__main__":
-    # User input
-    user_input = "Write a Python function that can determine if a number is prime"
+    # Try a research task
+    user_input = "research the top 10 resturants in greer, sc"
     request = RequestSchema(content=user_input)
     
-    print(f"📨 User Request: {request.content}")
-    print(f"   Request ID: {request.request_id}")
-    
-    # Execute with orchestrator (handles everything)
-    orchestrator = Orchestrator(max_retries=2)  # 3 total attempts
+    orchestrator = Orchestrator(max_retries=2)
     plan = orchestrator.execute_request(request)
     
-    # Summary
     print(f"\n{'=' * 80}")
-    print(f"SUMMARY")
+    print(f"RESULT")
     print(f"{'=' * 80}")
     print(f"Plan Status: {plan.status}")
     print(f"Total Tokens: {plan.token_usage}")
-    print(f"Tasks: {len(plan.tasks)}")
-    for i, task in enumerate(plan.tasks):
-        print(f"  [{i}] {task.status} - {task.goal[:60]}...")
-        if task.retry_count > 0:
-            print(f"      Retries: {task.retry_count}")
     
-    print(f"\n💡 Run 'python inspect_results.py' to see generated code")
+    for i, task in enumerate(plan.tasks):
+        print(f"\nTask {i}:")
+        print(f"  Goal: {task.goal[:80]}...")
+        print(f"  Status: {task.status}")
+        if task.error_message:
+            print(f"  Error: {task.error_message}")

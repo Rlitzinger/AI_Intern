@@ -1,0 +1,10 @@
+# AI Intern - User Data
+user_data/
+outputs/
+ai_intern_db.sqlite
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+temp_*.py

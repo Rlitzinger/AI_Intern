@@ -55,9 +55,8 @@ This is the minimal vertical slice needed to run a multi agent system. A simple 
 - [X] Schemas defined
 - [X] LLM wrapper working
 - [X] Planning agent implemented
-- [ ] Executor implemented (stub)
+- [X] Executor implemented (stub)
 - [X] Coding agent implemented
-- [ ] Validation implemented (stub)
-- [ ] SQLite storage working
-- [ ] End-to-end flow tested
-- [ ] Add function around coding output to install libraries if imported
+- [X] Validation implemented (stub)
+- [X] SQLite storage working
+- [X] End-to-end flow tested
