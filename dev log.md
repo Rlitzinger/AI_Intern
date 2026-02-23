@@ -81,3 +81,19 @@
 -  working on updating the validation engine to be able to spin up local server code to test (like flask django)
     - having issues with the server not spinning up and there being bad tests
 - was able to create a harnass that executes servers, and sends/receives info from them
+- starting work on reading in user data from a local folder in the project, and adding output folder to put info into from the project
+
+# 2/22/2026
+- tons stuff done today
+- multi-step planner that uses the hierarchial decomp to simplify tasks down
+    - looks at a plan (research x, code y, return file z)
+    - if the task is complex (not simple) then it breaks it down further into more steps
+    - if it's ambiguous, it tries to clarify the request (not clear)
+    - so clear/ambiguous and simple/complex
+    - makes branches if it's complex, and labels a leaf if it's clear and simple
+- added context send between steps in a process
+    - the coding agent will receive the output of the research agent
+- file agent can now save python files too
+- did a ton of work to make the process smoother, fixed a lot of error issues
+- reorganized the file into sub-agent folders, based around each section
+    - like one for planning, execution, orchestration, etc
