@@ -97,3 +97,12 @@
 - did a ton of work to make the process smoother, fixed a lot of error issues
 - reorganized the file into sub-agent folders, based around each section
     - like one for planning, execution, orchestration, etc
+
+# 2/23/2026
+- claude did a massive rewrite of a ton of code and made a ton of changes overnight
+- completely new settings, logging system, config is now pydantic, richer schemas, better request processing (avg became average)
+- added anlaysis agent
+- smarter task routing
+- full 3 hierarchial planner
+- orchestrator can preprocess prompts, works with dependencies, synthesizes answers so i can understand them, puts error history in context, resets goals on retry
+- better guards against hallucinations

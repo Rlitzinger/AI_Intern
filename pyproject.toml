@@ -1,0 +1,25 @@
+[project]
+name = "ai-intern"
+version = "0.1.0"
+description = "Multi-agent task execution system using local Ollama models"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "requests>=2.28",
+    "psutil>=5.9",
+    "duckduckgo-search>=4.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
+[project.scripts]
+ai-intern = "ai_intern.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

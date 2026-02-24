@@ -1,0 +1,60 @@
+from pydantic import BaseModel, Field
+from datetime import datetime, timezone
+from typing import Literal, NamedTuple, Optional
+from uuid import uuid4
+
+
+class TaskOutput(BaseModel):
+    """Structured output from a task, beyond just raw text."""
+    output_type: Literal["text", "code", "data", "file_path", "error"] = "text"
+    raw_result: str = ""
+    data_summary: Optional[str] = None  # Brief summary for context passing
+    column_names: Optional[list[str]] = None  # For CSV/data tasks
+    row_count: Optional[int] = None
+    file_path: Optional[str] = None
+    key_values: Optional[dict] = None  # Extracted key-value pairs
+
+
+class RequestSchema(BaseModel):
+    request_id: str = Field(default_factory=lambda: str(uuid4()))
+    content: str
+    schema_version: str = "0.0.1"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class TaskSchema(BaseModel):
+    task_id: str = Field(default_factory=lambda: str(uuid4()))
+    plan_id: str
+    task_order: int
+    goal: str
+    original_goal: str = ""  # Immutable copy of the original goal (#9)
+    status: Literal["pending", "executing", "validating", "complete", "validated", "failed", "skipped"] = "pending"
+    retry_count: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at: Optional[datetime] = None
+    schema_version: str = "0.0.1"
+    result: Optional[str] = None  # Generated code / raw text
+    task_output: Optional[TaskOutput] = None  # Structured output (#5)
+    test_code: Optional[str] = None  # Generated tests
+    error_message: Optional[str] = None
+    error_history: list[dict] = []  # [{attempt, error, test_code}] (#9)
+    depends_on: list[int] = []  # Task order values this depends on (#19)
+
+
+class PlanSchema(BaseModel):
+    plan_id: str = Field(default_factory=lambda: str(uuid4()))
+    request_id: str
+    tasks: list[TaskSchema] = []
+    status: Literal["planning", "critiquing", "executing", "validating", "complete", "failed"] = "planning"
+    retry_count: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at: Optional[datetime] = None
+    schema_version: str = "0.0.1"
+    token_usage: int = 0
+    final_answer: Optional[str] = None  # (#6) Synthesized final answer
+
+
+class AgentResult(NamedTuple):
+    """Standard return type for agent execute_task methods."""
+    task: TaskSchema
+    tokens_used: int
