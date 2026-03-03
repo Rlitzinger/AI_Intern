@@ -217,12 +217,27 @@ Return ONLY executable Python test code.
     Return ONLY Python test code using assert statements.
     """
 
+        # If there's an output contract, add interface-driven test requirements
+        contract_block = ""
+        if task.output_contract:
+            iface = task.output_contract.get("public_interface", "")
+            if iface:
+                contract_block = f"""
+This code must implement the following public interface:
+{iface}
+
+Tests must verify:
+1. Each listed method/function exists on the class or module
+2. Each method accepts the documented parameters without raising TypeError
+3. Basic return type is correct (not None unless documented)
+"""
+
         prompt = f"""Given this Python code:
 
     {task.result}
 
     Task goal: {task.goal}
-
+    {contract_block}
     {test_instructions}
 
     CRITICAL: Return ONLY executable Python test code using assert statements.

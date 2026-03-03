@@ -94,16 +94,17 @@ def run_classifier(goal: str):
 
     try:
         t0 = time.perf_counter()
-        verdict, reasoning, tokens = TaskClassifier.classify(task)
+        verdict, reasoning, tokens, is_app_scale = TaskClassifier.classify(task)
         elapsed = time.perf_counter() - t0
 
         print(f"\r  {color('Result:', BOLD)}")
         field("Verdict",   verdict_color(verdict))
         field("Complex?",  color("Yes", YELLOW) if verdict in (TaskVerdict.DECOMPOSE, TaskVerdict.CLARIFY_THEN_DECOMPOSE) else color("No", GREEN))
         field("Ambiguous?",color("Yes", MAGENTA) if verdict in (TaskVerdict.CLARIFY, TaskVerdict.CLARIFY_THEN_DECOMPOSE) else color("No", GREEN))
+        field("App-scale?",color("Yes", YELLOW) if is_app_scale else color("No", GREEN))
         dimfield("Reasoning", reasoning)
         field("Tokens", f"{tokens}  |  Time: {elapsed:.2f}s")
-        return verdict, reasoning, tokens
+        return verdict, reasoning, tokens, is_app_scale
 
     except Exception as e:
         print()
@@ -305,7 +306,7 @@ def run_suite(task_inputs: list[str] | None = None):
         cls_tokens = 0
 
         if cls_result is not None:
-            verdict, _, cls_tokens = cls_result
+            verdict, _, cls_tokens, _is_app_scale = cls_result
             total_tokens += cls_tokens
 
             if expected is not None:

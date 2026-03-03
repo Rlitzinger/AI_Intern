@@ -20,6 +20,7 @@ class ClassificationResult(BaseModel):
     """LLM response schema for task classification."""
     is_complex: bool
     is_ambiguous: bool
+    is_app_scale: bool  # Does this require multi-file structured output?
     reasoning: str
 
 
@@ -46,7 +47,7 @@ Be precise and analytical in your reasoning.
 Respond with the exact JSON structure requested."""
 
     @classmethod
-    def classify(cls, task: TaskSchema, context: dict = None) -> tuple[TaskVerdict, str, int]:
+    def classify(cls, task: TaskSchema, context: dict = None) -> tuple[TaskVerdict, str, int, bool]:
         """
         Classify a task into one of 4 verdicts based on complexity and ambiguity.
 
@@ -55,10 +56,13 @@ Respond with the exact JSON structure requested."""
             context: Optional context from parent tasks or previous steps
 
         Returns:
-            tuple: (verdict, reasoning, tokens_used)
+            tuple: (verdict, reasoning, tokens_used, is_app_scale)
         """
+        # Extract environment context if present
+        env = context.get('environment', '') if context else ''
+
         # Build the classification prompt
-        prompt = cls._build_prompt(task, context)
+        prompt = cls._build_prompt(task, context, environment=env)
 
         # Call LLM to get classification
         result, tokens = call_ollama_structured(
@@ -72,22 +76,26 @@ Respond with the exact JSON structure requested."""
         # Map (is_complex, is_ambiguous) to verdict
         verdict = cls._map_to_verdict(result.is_complex, result.is_ambiguous)
 
-        return verdict, result.reasoning, tokens
+        return verdict, result.reasoning, tokens, result.is_app_scale
 
     @staticmethod
-    def _build_prompt(task: TaskSchema, context: dict = None) -> str:
+    def _build_prompt(task: TaskSchema, context: dict = None, environment: str = "") -> str:
         """Build the classification prompt."""
 
         prompt_parts = []
 
-        # Add context if available
+        # Inject environment context if available
+        if environment:
+            prompt_parts.append(environment + "\n\n")
+
+        # Add parent goal context if available
         if context and context.get('parent_goal'):
             prompt_parts.append(f"Parent goal: {context['parent_goal']}\n")
 
         prompt_parts.append(f"Task to classify: {task.goal}\n")
 
         prompt_parts.append("""
-Classify this task on two dimensions:
+Classify this task on THREE dimensions:
 
 1. COMPLEXITY: Does this need more than ONE distinct action?
    SIMPLE = one action (one function, one file read, one search)
@@ -112,7 +120,27 @@ Classify this task on two dimensions:
 
    Note: Ambiguous inputs don't add complexity. "Write a function using the research" = SIMPLE + AMBIGUOUS.
 
-Return JSON: {"is_complex": bool, "is_ambiguous": bool, "reasoning": "2-3 sentences"}
+3. SCALE: Does this require a multi-file application where components import each other?
+   APP_SCALE = multiple Python files that must work together (e.g. storage + API + CLI)
+   SINGLE_OUTPUT = one script, one function, one file, one answer
+
+   Decision rule: would a complete answer require files that import from each other?
+
+   APP_SCALE examples:
+   - "Build a note-taking app with save, load, and list" → APP_SCALE (needs storage.py + cli.py at minimum)
+   - "Make me a workout tracker that persists data across sessions" → APP_SCALE (data layer + logic + interface)
+   - "Create a full REST API with user auth and a database" → APP_SCALE (auth.py + routes.py + db.py)
+   - "Build a platform for managing personal finances" → APP_SCALE (multi-component implied by "platform")
+
+   SINGLE_OUTPUT examples:
+   - "Build a fibonacci function" → SINGLE_OUTPUT (one function in one file)
+   - "Create a script to read CSV and compute averages" → SINGLE_OUTPUT (one script)
+   - "Write a calculator that adds and subtracts" → SINGLE_OUTPUT (one script)
+   - "Research stock prices and write a trend calculator" → SINGLE_OUTPUT (produces one script)
+   - "Help me plan my workouts for the rest of the week" → SINGLE_OUTPUT (produces one answer/document)
+   - "Based on my purchase history, help me make high-protein dinners" → SINGLE_OUTPUT (one plan document)
+
+Return JSON: {"is_complex": bool, "is_ambiguous": bool, "is_app_scale": bool, "reasoning": "2-3 sentences"}
 """)
 
         return "".join(prompt_parts)

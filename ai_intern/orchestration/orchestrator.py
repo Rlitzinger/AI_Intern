@@ -4,6 +4,7 @@ from .routing import TaskRouter
 from ..planning.planner import PlanningAgent
 from ..planning.hierarchical import HierarchicalPlanner
 from ..validation.validator import ValidationAgent
+from ..workspace import ProjectWorkspace
 from ..llm import call_ollama_code
 from ..preprocessing import preprocess_request
 from ..config import settings
@@ -42,6 +43,21 @@ class Orchestrator:
 
         logger.info(f"Generated {len(plan.tasks)} task(s)")
 
+        # Log app spec summary if one was generated
+        if plan.app_spec:
+            spec = plan.app_spec
+            logger.info("=== APP SPEC GENERATED ===")
+            logger.info(f"Summary: {spec.get('summary', '')}")
+            logger.info(f"Features: {'; '.join(spec.get('features', []))}")
+            components = spec.get('components', [])
+            logger.info(f"Components ({len(components)}):")
+            for c in components:
+                logger.info(
+                    f"  - {c['name']} → {c['output_file']} | {c['public_interface']}"
+                )
+            logger.info(f"Done criteria: {'; '.join(spec.get('done_criteria', []))}")
+            logger.info("==========================")
+
         # Auto-detect dependencies (#19)
         self._auto_detect_dependencies(plan)
 
@@ -55,6 +71,13 @@ class Orchestrator:
 
         # === STAGE 2: EXECUTION + VALIDATION (with retries) ===
         logger.info("Stage 2: Execution & Validation")
+
+        # Create project workspace if this is an app-scale plan
+        workspace: ProjectWorkspace | None = None
+        if plan.app_spec:
+            workspace = ProjectWorkspace(plan.plan_id)
+            plan.workspace_root = str(workspace.root)
+            logger.info(f"Workspace created: {workspace.root}")
 
         for i, task in enumerate(plan.tasks):
             logger.info(f"Task {i}: {task.goal[:60]}...")
@@ -72,7 +95,7 @@ class Orchestrator:
                     logger.warning(f"Task {i} skipped (dependency failed)")
                     continue
 
-            success = self._execute_task_with_retry(task, plan)
+            success = self._execute_task_with_retry(task, plan, workspace=workspace)
 
             if success:
                 logger.info(f"Task {i} completed successfully")
@@ -113,7 +136,12 @@ class Orchestrator:
 
         return plan
 
-    def _execute_task_with_retry(self, task: TaskSchema, plan: PlanSchema) -> bool:
+    def _execute_task_with_retry(
+        self,
+        task: TaskSchema,
+        plan: PlanSchema,
+        workspace: ProjectWorkspace | None = None,
+    ) -> bool:
         """Execute a task with retry logic."""
         attempt = 0
 
@@ -147,6 +175,24 @@ class Orchestrator:
                     if t.task_order < task.task_order and t.result is not None
                 ]
             }
+
+            # Inject workspace context for tasks that depend on prior components
+            if workspace and task.output_contract:
+                depends_on_names = task.output_contract.get("depends_on", [])
+                # Fall back to spec component depends_on if not in contract
+                if not depends_on_names and plan.app_spec:
+                    for comp in plan.app_spec.get("components", []):
+                        if comp["name"] == task.output_contract.get("component_name"):
+                            depends_on_names = comp.get("depends_on", [])
+                            break
+
+                if depends_on_names:
+                    workspace_ctx = workspace.get_context_for_task(depends_on_names)
+                    import_lines = workspace.resolve_imports(depends_on_names)
+                    if workspace_ctx:
+                        context['workspace_context'] = workspace_ctx
+                    if import_lines:
+                        context['workspace_imports'] = import_lines
 
             # Pass error history to context for retry (#9)
             if task.error_history:
@@ -187,6 +233,36 @@ class Orchestrator:
                 task_type = TaskRouter.classify_task(task)
                 if task_type == "code":
                     self._try_execute_code(task)
+
+                # Register component in workspace manifest and write file
+                if workspace and task.output_contract:
+                    contract = task.output_contract
+                    raw_output_file = contract.get("output_file", "")
+                    # Derive the filename within the workspace
+                    rel_file = os.path.basename(raw_output_file) if raw_output_file else ""
+                    if not rel_file:
+                        rel_file = raw_output_file.removeprefix("outputs/").lstrip("/")
+
+                    # Write code to workspace/{plan_id}/storage.py etc.
+                    if rel_file and task.result:
+                        from pathlib import Path as _Path
+                        ws_file_path = _Path(workspace.root) / rel_file
+                        ws_file_path.write_text(task.result, encoding="utf-8")
+                        logger.info(f"Wrote component to workspace: {rel_file}")
+                        # Record the path on task_output so it's inspectable
+                        if not task.task_output:
+                            task.task_output = TaskOutput(
+                                output_type="code", raw_result=task.result
+                            )
+                        task.task_output.file_path = str(ws_file_path)
+
+                    workspace.register_component(
+                        name=contract["component_name"],
+                        file_path=rel_file,
+                        interface=contract["public_interface"],
+                        depends_on=contract.get("depends_on", []),
+                    )
+
                 return True
 
             # Failed - record to error history (#9)
@@ -216,6 +292,11 @@ class Orchestrator:
             plan.final_answer = "No tasks completed successfully."
             return
 
+        # Workspace-aware final answer for app-scale plans
+        if plan.workspace_root:
+            plan.final_answer = self._synthesize_workspace_answer(plan, completed_tasks)
+            return
+
         # If the last completed task produced a file path, report it
         last_task = completed_tasks[-1]
         if last_task.task_output and last_task.task_output.file_path:
@@ -242,6 +323,51 @@ class Orchestrator:
             return
 
         plan.final_answer = "Plan completed but no result was generated."
+
+    def _synthesize_workspace_answer(
+        self, plan: PlanSchema, completed_tasks: list[TaskSchema]
+    ) -> str:
+        """Build the final answer for an app-scale plan with a workspace."""
+        workspace_root = plan.workspace_root
+        manifest_path = os.path.join(workspace_root, "project.json")
+
+        # Read the manifest to list components and their files
+        component_lines = []
+        if os.path.exists(manifest_path):
+            try:
+                import json as _json
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    manifest = _json.load(f)
+                for name, entry in manifest.items():
+                    fp = entry.get("file_path", "")
+                    iface = entry.get("interface", "")
+                    deps = entry.get("depends_on", [])
+                    line = f"  - {fp:<20} → {name}: {iface}"
+                    if deps:
+                        line += f"  (depends on: {', '.join(deps)})"
+                    component_lines.append(line)
+            except Exception as e:
+                logger.warning(f"Failed to read manifest for final answer: {e}")
+
+        # Detect an entry point
+        entry_point = ""
+        for t in completed_tasks:
+            goal_lower = t.goal.lower()
+            if "cli" in goal_lower or "main" in goal_lower or "entry" in goal_lower:
+                if t.task_output and t.task_output.file_path:
+                    entry_point = t.task_output.file_path
+
+        lines = [f"Application generated in: {workspace_root}", "", "Files:"]
+        if component_lines:
+            lines.extend(component_lines)
+        else:
+            lines.append("  (no components registered)")
+
+        if entry_point:
+            lines.append("")
+            lines.append(f"To run: python {entry_point}")
+
+        return "\n".join(lines)
 
     def _llm_synthesize(self, plan: PlanSchema, completed_tasks: list[TaskSchema]) -> str:
         """Use LLM to synthesize final answer from multiple task results."""

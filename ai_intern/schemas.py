@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
-from typing import Literal, NamedTuple, Optional
+from typing import Any, Literal, NamedTuple, Optional
 from uuid import uuid4
 
 
@@ -39,6 +39,8 @@ class TaskSchema(BaseModel):
     error_message: Optional[str] = None
     error_history: list[dict] = []  # [{attempt, error, test_code}] (#9)
     depends_on: list[int] = []  # Task order values this depends on (#19)
+    output_contract: Optional[dict] = None  # {component_name, output_file, public_interface}
+    suggested_agent: Optional[str] = None   # "code", "research", "file", "analysis" — set by planner
 
 
 class PlanSchema(BaseModel):
@@ -52,6 +54,8 @@ class PlanSchema(BaseModel):
     schema_version: str = "0.0.1"
     token_usage: int = 0
     final_answer: Optional[str] = None  # (#6) Synthesized final answer
+    app_spec: Optional[dict] = None     # Serialised AppSpec, if generated
+    workspace_root: Optional[str] = None  # Path to this plan's workspace directory
 
 
 class AgentResult(NamedTuple):

@@ -120,10 +120,27 @@ class TaskRouter:
     @classmethod
     def route_task(cls, task: TaskSchema, context: dict = None) -> tuple[TaskSchema, int]:
         """Route task to the appropriate agent based on task type."""
+        # Spec-driven tasks always go to CodingAgent — they are code generation
+        # tasks regardless of what the keyword scorer says
+        if task.output_contract:
+            logger.info("Routing: output_contract present → CodingAgent (spec-driven)")
+            return CodingAgent.execute_task(task, context)
+
+        # Planner-annotated agent type (strong signal — use directly)
+        if task.suggested_agent:
+            logger.info(f"Routing: planner suggested '{task.suggested_agent}'")
+            return cls._route_by_type(task.suggested_agent, task, context)
+
+        # Fallback: keyword scoring
         task_type = cls.classify_task(task)
+        logger.info(f"Routing: keyword scoring → '{task_type}'")
+        return cls._route_by_type(task_type, task, context)
 
-        logger.info(f"Routing: Detected task type '{task_type}'")
-
+    @classmethod
+    def _route_by_type(
+        cls, task_type: str, task: TaskSchema, context: dict = None
+    ) -> tuple[TaskSchema, int]:
+        """Dispatch to the right agent by type string."""
         if task_type == "file":
             return FileAgent.execute_task(task, context)
         elif task_type == "code":
@@ -133,5 +150,5 @@ class TaskRouter:
         elif task_type == "analysis":
             return AnalysisAgent.execute_task(task, context)
         else:
-            logger.warning("Unknown task type, defaulting to CodingAgent")
+            logger.warning(f"Unknown task type '{task_type}', defaulting to CodingAgent")
             return CodingAgent.execute_task(task, context)

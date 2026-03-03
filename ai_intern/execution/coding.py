@@ -51,6 +51,15 @@ Your response should start directly with Python code (imports or function defini
 
             prompt_parts.append("Use the above information when writing your code.\n\n")
 
+        # Inject workspace context for app-scale tasks with component dependencies
+        if context and context.get('workspace_context'):
+            prompt_parts.append("AVAILABLE COMPONENTS (already implemented — import these, do not rewrite):\n")
+            prompt_parts.append(context['workspace_context'] + "\n")
+            if context.get('workspace_imports'):
+                prompt_parts.append("\nRequired imports for this task:\n")
+                prompt_parts.append(context['workspace_imports'] + "\n")
+            prompt_parts.append("\nYour code must import from the paths shown above.\n\n")
+
         # Budget check: truncate context if prompt is too large
         context_text = "".join(prompt_parts)
         budget = settings.MAX_PROMPT_TOKENS - 500  # reserve 500 for task + instructions
