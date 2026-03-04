@@ -126,7 +126,12 @@ class TaskRouter:
             logger.info("Routing: output_contract present → CodingAgent (spec-driven)")
             return CodingAgent.execute_task(task, context)
 
-        # Planner-annotated agent type (strong signal — use directly)
+        # Decomposer-declared agent type (explicit — highest non-spec priority)
+        if task.declared_agent:
+            logger.info(f"Routing: declared agent '{task.declared_agent}' (from SubtaskSpec)")
+            return cls._route_by_type(task.declared_agent, task, context)
+
+        # Planner-annotated agent type (heuristic inference — use as fallback)
         if task.suggested_agent:
             logger.info(f"Routing: planner suggested '{task.suggested_agent}'")
             return cls._route_by_type(task.suggested_agent, task, context)

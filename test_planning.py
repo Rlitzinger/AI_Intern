@@ -28,6 +28,7 @@ from ai_intern.planning.classifier import TaskClassifier, TaskVerdict
 from ai_intern.planning.hierarchical import HierarchicalPlanner
 from ai_intern.planning.spec_generator import SpecGenerator
 from ai_intern.planning.environment import EnvironmentScanner
+from ai_intern.planning.context import PlanningContext
 from ai_intern.config import settings
 
 # ─────────────────────────────────────────────────────────
@@ -105,10 +106,22 @@ def verdict_badge(v: TaskVerdict) -> str:
     return c(f"[{v.value.upper()}]", BOLD, vc.get(v, RESET))
 
 
-def agent_badge(agent: str | None) -> str:
+def agent_badge(agent: str | None, source: str = "") -> str:
     ac = {"code": CYAN, "research": BLUE, "file": YELLOW, "analysis": MAGENTA}
     a = (agent or "?").lower()
-    return c(f"[{a}]", BOLD, ac.get(a, DIM))
+    badge = c(f"[{a}]", BOLD, ac.get(a, DIM))
+    if source:
+        badge += c(f" ({source})", DIM)
+    return badge
+
+
+def task_agent_badge(task: TaskSchema) -> str:
+    """Show declared_agent (from SubtaskSpec) or suggested_agent with source label."""
+    if task.declared_agent:
+        return agent_badge(task.declared_agent, "declared")
+    if task.suggested_agent:
+        return agent_badge(task.suggested_agent, "suggested")
+    return agent_badge(None)
 
 
 def yn(val: bool) -> str:
@@ -122,6 +135,7 @@ def yn(val: bool) -> str:
 def run_classify(
     goal: str,
     env_prompt: str = "",
+    planning_context: "PlanningContext | None" = None,
 ) -> "tuple | None":
     """
     Calls TaskClassifier once and shows all 3 axes of the result:
@@ -132,12 +146,17 @@ def run_classify(
     step_header(1, "TaskClassifier  (complexity x ambiguity x app-scale)")
     task = TaskSchema(plan_id="test", task_order=0, goal=goal)
     field("Goal", c(goal, DIM))
+    if planning_context and planning_context.available_files:
+        files_str = ", ".join(planning_context.available_files[:5])
+        field("Files visible to classifier", c(files_str, DIM))
     print(f"      {c('Calling Ollama...', DIM)}", end="", flush=True)
 
     try:
         t0 = time.perf_counter()
         verdict, reasoning, tokens, is_app_scale_llm = TaskClassifier.classify(
-            task, {"environment": env_prompt}
+            task,
+            planning_context=planning_context,
+            context={"environment": env_prompt},
         )
         elapsed = time.perf_counter() - t0
         print()
@@ -189,6 +208,7 @@ def run_walkthrough(
     verdict: TaskVerdict,
     is_app_scale: bool,
     env_prompt: str = "",
+    planning_context: "PlanningContext | None" = None,
 ) -> int:
     """
     Manually invokes each inner planning step based on verdict + is_app_scale.
@@ -351,16 +371,20 @@ def run_walkthrough(
     subtasks = []
     try:
         t0 = time.perf_counter()
-        subtasks, decomp_tokens = HierarchicalPlanner._decompose_task(decompose_target, ctx)
+        subtasks, decomp_tokens = HierarchicalPlanner._decompose_task(
+            decompose_target, ctx, planning_context
+        )
         elapsed = time.perf_counter() - t0
         total += decomp_tokens
         print()
         field("Subtasks returned", f"{len(subtasks)} in {elapsed:.2f}s  |  {decomp_tokens} tok")
-        print(f"      {c('(The LLM may return up to 3; hallucination filter may remove some)', DIM)}")
+        print(f"      {c('(The LLM may return up to 4; hallucination filter may remove some)', DIM)}")
         for i, st in enumerate(subtasks):
             print()
-            print(f"        {c('[' + str(i) + ']', BOLD, CYAN)} {agent_badge(st.suggested_agent)}")
-            field("          Goal",  c(st.goal, DIM))
+            print(f"        {c('[' + str(i) + ']', BOLD, CYAN)} {task_agent_badge(st)}")
+            field("          Goal", c(st.goal, DIM))
+            if st.declared_agent:
+                field("          declared_agent", c(st.declared_agent, GREEN))
 
     except Exception as e:
         print()
@@ -381,8 +405,11 @@ def run_walkthrough(
             print()
             print(f"        {c('[' + str(i) + ']', BOLD, CYAN)}")
             dimfield("          Goal",                  st.goal[:70])
+            if st.declared_agent:
+                field("          declared_agent",        c(st.declared_agent, GREEN) + c("  (from SubtaskSpec -- routing is deterministic)", DIM))
+            else:
+                field("          Inferred agent",        agent_badge(inferred))
             field(   "          _is_obviously_simple", f"{yn(is_simple)}  ->  {fate}")
-            field(   "          Inferred agent",        agent_badge(inferred))
 
     return total
 
@@ -435,7 +462,7 @@ def run_full_plan(request: RequestSchema) -> "PlanSchema | None":
         for task in plan.tasks:
             print()
             badge = c(f"[{task.task_order}]", BOLD, CYAN)
-            print(f"      {badge}  {agent_badge(task.suggested_agent)}")
+            print(f"      {badge}  {task_agent_badge(task)}")
 
             # Show full multi-line goal (spec-driven goals span 4-5 lines)
             goal_lines = task.goal.split("\n")
@@ -444,6 +471,14 @@ def run_full_plan(request: RequestSchema) -> "PlanSchema | None":
                     field("        Goal", c(line, DIM))
                 else:
                     print(f"               {c(line, DIM)}")
+
+            # Agent routing source
+            if task.declared_agent:
+                field("        Routing", c(f"declared_agent={task.declared_agent}", GREEN) + c("  (from SubtaskSpec)", DIM))
+            elif task.suggested_agent:
+                field("        Routing", c(f"suggested_agent={task.suggested_agent}", YELLOW) + c("  (heuristic)", DIM))
+            else:
+                field("        Routing", c("keyword scoring (fallback)", DIM))
 
             # output_contract (only on spec-driven component tasks)
             if task.output_contract:
@@ -514,6 +549,7 @@ def run_case(
     # Scan environment once; share across all steps
     env_ctx    = EnvironmentScanner.scan()
     env_prompt = env_ctx.to_prompt_block()
+    planning_ctx = PlanningContext.build()
     if env_ctx.available_files:
         files_str = ", ".join(f.filename for f in env_ctx.available_files[:5])
         print(f"  {c('Files in user_data/:', BOLD)} {c(files_str, DIM)}")
@@ -521,7 +557,7 @@ def run_case(
     total_tokens = 0
 
     # Step 1 -- classify
-    cls_result = run_classify(goal, env_prompt)
+    cls_result = run_classify(goal, env_prompt, planning_context=planning_ctx)
     if cls_result is None:
         print(f"\n  {c('Classification failed -- skipping remaining steps.', RED)}")
         return None
@@ -535,7 +571,7 @@ def run_case(
         print(f"\n      Expected: {verdict_badge(expected)}  ->  {status}")
 
     # Step 2 -- walk-through
-    walk_tokens = run_walkthrough(goal, verdict, is_app_scale, env_prompt)
+    walk_tokens = run_walkthrough(goal, verdict, is_app_scale, env_prompt, planning_context=planning_ctx)
     total_tokens += walk_tokens
 
     # Step 3 -- full plan (skipped in --quick mode)

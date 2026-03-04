@@ -47,12 +47,13 @@ Be precise and analytical in your reasoning.
 Respond with the exact JSON structure requested."""
 
     @classmethod
-    def classify(cls, task: TaskSchema, context: dict = None) -> tuple[TaskVerdict, str, int, bool]:
+    def classify(cls, task: TaskSchema, planning_context=None, context: dict = None) -> tuple[TaskVerdict, str, int, bool]:
         """
         Classify a task into one of 4 verdicts based on complexity and ambiguity.
 
         Args:
             task: The task to classify
+            planning_context: Optional PlanningContext with file list and agent roster
             context: Optional context from parent tasks or previous steps
 
         Returns:
@@ -62,7 +63,7 @@ Respond with the exact JSON structure requested."""
         env = context.get('environment', '') if context else ''
 
         # Build the classification prompt
-        prompt = cls._build_prompt(task, context, environment=env)
+        prompt = cls._build_prompt(task, planning_context=planning_context, context=context, environment=env)
 
         # Call LLM to get classification
         result, tokens = call_ollama_structured(
@@ -79,13 +80,17 @@ Respond with the exact JSON structure requested."""
         return verdict, result.reasoning, tokens, result.is_app_scale
 
     @staticmethod
-    def _build_prompt(task: TaskSchema, context: dict = None, environment: str = "") -> str:
+    def _build_prompt(task: TaskSchema, planning_context=None, context: dict = None, environment: str = "") -> str:
         """Build the classification prompt."""
 
         prompt_parts = []
 
-        # Inject environment context if available
-        if environment:
+        # Inject planning context FIRST (front-loaded for attention)
+        if planning_context:
+            prompt_parts.append(planning_context.format_for_prompt())
+            prompt_parts.append("\n\n")
+        elif environment:
+            # Fall back to raw environment block if no PlanningContext provided
             prompt_parts.append(environment + "\n\n")
 
         # Add parent goal context if available

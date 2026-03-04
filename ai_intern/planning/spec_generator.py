@@ -1,3 +1,4 @@
+import re
 from pydantic import BaseModel
 from ..llm import call_ollama_structured
 from ..config import settings
@@ -5,6 +6,39 @@ from ..logging_config import get_logger
 from ..schemas import TaskSchema
 
 logger = get_logger("spec_generator")
+
+
+class IntentSpec(BaseModel):
+    """
+    Extracted user intent. Internal scaffolding only — never stored on plan or task.
+    Exists only to ground the component design in Call 2.
+    """
+    primary_action: str
+    # The ONE thing the user must be able to do, written as an active verb phrase.
+    # Examples:
+    #   "turn written text into a generated image"
+    #   "track daily workouts and view progress over time"
+    #   "store and retrieve personal notes with search"
+    # NOT "build a web app" — that describes the container, not the action.
+
+    core_capability: str
+    # The specific technical mechanism that makes primary_action possible.
+    # Name the specific technology or algorithm required.
+    # Examples:
+    #   "call an image generation API (e.g. Stable Diffusion, DALL-E, or Replicate)"
+    #   "persist workout records to SQLite and compute aggregate stats"
+    #   "full-text search over stored note content"
+    # If the request doesn't specify, name the most appropriate option and note it's assumed.
+
+    capability_owner: str
+    # The PascalCase name of the component that must own core_capability.
+    # This component MUST appear in the final AppSpec.
+    # Examples: "ImageGenerator", "WorkoutTracker", "NoteSearchEngine"
+
+    constraints: list[str]
+    # Explicit constraints from the user's request (platform, language, format, etc.)
+    # Leave empty list if none stated. Do NOT invent constraints.
+    # Examples: ["web app (HTTP server)", "Python only", "no external database"]
 
 
 class ComponentSpec(BaseModel):
@@ -27,134 +61,162 @@ class AppSpec(BaseModel):
 class SpecGenerator:
     """
     Generates a structured AppSpec from an app-scale request.
-    Called when a task is classified as CLARIFY_THEN_DECOMPOSE
-    and the goal contains app-scale keywords.
+    Uses a two-phase approach: Phase 1 extracts intent (IntentSpec),
+    Phase 2 designs components grounded in that intent.
     """
 
-    @staticmethod
-    def generate(task: TaskSchema, context: dict) -> tuple[AppSpec, int]:
+    model = settings.PLANNING_MODEL
+    temperature = settings.PLANNING_TEMP
+
+    @classmethod
+    def generate(cls, task: TaskSchema, context: dict) -> tuple[AppSpec, int]:
         """
-        Generate a structured application spec from the task goal.
-        Returns (spec, tokens_used).
+        Two-phase spec generation.
+        Phase 1: Extract user intent (IntentSpec) — flat schema, low temperature.
+        Phase 2: Design components grounded in intent — IntentSpec injected as ground truth.
         """
         logger.info(f"SpecGenerator: generating spec for: {task.goal[:80]}...")
+        total_tokens = 0
 
-        system_prompt = (
-            "You are a software architect who specialises in decomposing apps into small, "
-            "focused Python modules. Each module must be implementable in under 40 lines of code "
-            "with no more than 3 simple functions. Never combine unrelated concerns into one module."
-        )
+        # Phase 1: Intent extraction
+        intent, tokens_1 = cls._extract_intent(task.goal)
+        total_tokens += tokens_1
 
-        env_block = context.get('environment', '') if context else ''
-        env_header = f"{env_block}\n\n" if env_block else ""
+        # Log intent so failures are visible immediately
+        print(f"      [Intent] Primary action:   {intent.primary_action}")
+        print(f"      [Intent] Core capability:  {intent.core_capability}")
+        print(f"      [Intent] Capability owner: {intent.capability_owner}  <- must appear in components")
 
-        user_prompt = f"""{env_header}User request: {task.goal}
+        # Phase 2: Component design grounded in intent
+        spec, tokens_2 = cls._design_components(task.goal, intent)
+        total_tokens += tokens_2
 
-Generate a structured application spec. Split the app into FINE-GRAINED components.
-
-SIZE RULE (critical): Each component must be implementable in ≤40 lines of Python, ≤3 functions.
-- If a responsibility requires >40 lines, split it into two smaller components.
-- "MainApp" or "AppServer" are forbidden — they are always too big. Split them.
-
-COMPONENT COUNT: 3 to 6 components. Never fewer than 3, never more than 6.
-
-COMPONENT RULES:
-- Each component has exactly ONE responsibility. No mixing of concerns.
-- output_file: must be relative to outputs/ (e.g. "outputs/storage.py")
-- depends_on: list names of other components this module imports
-- public_interface: exact Python function signatures (e.g. "save(text: str) -> str")
-- done_criteria: 2-4 concrete testable statements
-
-HOW TO SPLIT WEB APPS (follow this pattern exactly):
-  1. DataStore     — file I/O only: read/write/list data to a JSON or CSV file
-  2. DataModel     — data structure only: a simple dict/dataclass representing one record
-  3. RouteHandlers — HTTP request logic: handle_get(path) and handle_post(path, body) -> (int, str)
-  4. HTMLTemplates — HTML strings only: get_form() -> str, get_list(items) -> str
-  5. Server        — server startup only: run(port: int) — creates HTTPServer and serves forever
-
-HOW TO SPLIT CLI APPS:
-  1. DataStore — file I/O: load(), save(record)
-  2. Commands  — user commands: cmd_add(args), cmd_list(), cmd_delete(id)
-  3. CLI       — entry point: parse_args(argv) -> (command, args), main()
-
-HOW TO SPLIT CALCULATORS/UTILITIES:
-  1. Logic     — pure functions: calculate(inputs) -> result
-  2. Interface — input/output: prompt_user() -> inputs, display(result)
-
-Return a JSON object:
-{{
-  "summary": "One sentence describing what the app does",
-  "features": ["feature 1", "feature 2"],
-  "components": [
-    {{
-      "name": "ComponentName",
-      "responsibility": "One sentence: single responsibility this module handles",
-      "output_file": "outputs/filename.py",
-      "depends_on": [],
-      "public_interface": "function1(arg: type) -> return_type, function2(arg: type) -> return_type"
-    }}
-  ],
-  "done_criteria": ["criteria 1", "criteria 2"]
-}}
-
-Example for "Build a note-taking app with save, load, list":
-{{
-  "summary": "A CLI note-taking app that saves and loads notes as JSON",
-  "features": ["save note to disk", "load note by id", "list all notes"],
-  "components": [
-    {{
-      "name": "NoteStore",
-      "responsibility": "Reads and writes notes to a JSON file on disk",
-      "output_file": "outputs/note_store.py",
-      "depends_on": [],
-      "public_interface": "save(text: str) -> str, load(id: str) -> dict, list_all() -> list"
-    }},
-    {{
-      "name": "NoteCommands",
-      "responsibility": "Implements the add, load, list commands using NoteStore",
-      "output_file": "outputs/note_commands.py",
-      "depends_on": ["NoteStore"],
-      "public_interface": "cmd_add(text: str), cmd_load(id: str), cmd_list()"
-    }},
-    {{
-      "name": "NoteCLI",
-      "responsibility": "Parses command-line arguments and calls NoteCommands",
-      "output_file": "outputs/note_cli.py",
-      "depends_on": ["NoteCommands"],
-      "public_interface": "parse_args(argv: list) -> tuple, main()"
-    }}
-  ],
-  "done_criteria": [
-    "save() returns a non-empty string id",
-    "load(id) returns the saved note dict",
-    "list_all() returns a list"
-  ]
-}}"""
-
-        spec, tokens = call_ollama_structured(
-            model=settings.PLANNING_MODEL,
-            prompt=user_prompt,
-            system=system_prompt,
-            response_schema=AppSpec,
-            temperature=settings.PLANNING_TEMP
-        )
-
-        # Enforce minimum 2 components — add a CLI/main entry point if the model collapsed to 1
-        if len(spec.components) < 2:
-            first = spec.components[0] if spec.components else None
-            first_name = first.name if first else "AppCore"
-            cli = ComponentSpec(
-                name="AppCLI",
-                responsibility="Provides a command-line interface to interact with the application.",
-                output_file="outputs/cli.py",
-                depends_on=[first_name] if first else [],
-                public_interface="main()",
-            )
-            spec.components.append(cli)
-            logger.info(f"Added synthetic AppCLI component (spec had only 1 component)")
+        # Safety net: verify capability_owner appears in components
+        component_names = [c.name for c in spec.components]
+        if intent.capability_owner not in component_names:
+            print(f"      WARNING: capability_owner '{intent.capability_owner}' missing from {component_names}")
+            print(f"      WARNING: Injecting missing component deterministically...")
+            logger.warning(f"capability_owner '{intent.capability_owner}' missing — injecting deterministically")
+            spec = cls._inject_capability_component(spec, intent)
 
         logger.info(f"Spec generated: {spec.summary}")
         logger.info(f"Components ({len(spec.components)}): {', '.join(c.name for c in spec.components)}")
         logger.info(f"Features ({len(spec.features)}): {'; '.join(spec.features)}")
 
-        return spec, tokens
+        return spec, total_tokens
+
+    @classmethod
+    def _extract_intent(cls, goal: str) -> tuple[IntentSpec, int]:
+        prompt = f"""User request: {goal}
+
+Extract the user's intent from this request.
+
+primary_action: The ONE thing the user must be able to DO.
+  - Write as an active verb phrase ("turn text into an image", "track workouts")
+  - Describe the ACTION, not the container ("web app" and "system" are containers, not actions)
+  - If the request says "turn X into Y", primary_action is exactly "turn X into Y"
+
+core_capability: The specific technical mechanism that makes primary_action possible.
+  - Name the algorithm, API, or data operation required
+  - Be concrete: "call image generation API (e.g. Stable Diffusion)" not "handle user input"
+  - If multiple options exist, pick the most appropriate and note it is assumed
+
+capability_owner: The PascalCase component name that will own core_capability.
+  - This component MUST be created in the final application
+  - Name it after what it does, not what layer it is: "ImageGenerator" not "Handler"
+
+constraints: List only explicit requirements from the user's request.
+  - Empty list if none stated. Do NOT invent constraints.
+
+Return JSON matching the IntentSpec schema."""
+
+        system = """You are an intent extraction expert.
+Your job is to identify what a user actually needs an application to DO.
+Focus entirely on the primary user action. Ignore architecture and implementation layers."""
+
+        return call_ollama_structured(
+            model=cls.model,
+            prompt=prompt,
+            system=system,
+            response_schema=IntentSpec,
+            temperature=0.1  # Intentionally low — extraction is deterministic
+        )
+
+    @classmethod
+    def _design_components(cls, goal: str, intent: IntentSpec) -> tuple[AppSpec, int]:
+        constraints_block = (
+            "Constraints from user:\n" + "\n".join(f"  - {c}" for c in intent.constraints)
+            if intent.constraints
+            else "Constraints: None stated -- use simplest reasonable defaults."
+        )
+
+        prompt = f"""User request: {goal}
+
+EXTRACTED INTENT -- treat this as ground truth, not a suggestion:
+  Primary action:    {intent.primary_action}
+  Core capability:   {intent.core_capability}
+  Capability owner:  {intent.capability_owner}
+{constraints_block}
+
+Design the application components.
+
+HARD RULES:
+1. {intent.capability_owner} MUST be component [0]. It implements: {intent.core_capability}
+2. Every other component exists to SUPPORT {intent.capability_owner}
+3. 3-5 components total. Each must be implementable in under 50 lines of Python.
+4. output_file must follow pattern: "outputs/<snake_case_name>.py"
+5. depends_on lists component NAMES (PascalCase), not file paths
+6. public_interface lists exact Python signatures only, nothing else
+
+Suggested component order (omit any that are not needed for this specific app):
+  1. {intent.capability_owner} -- REQUIRED -- implements {intent.core_capability}
+  2. Storage -- persists data to disk (if the app needs persistence)
+  3. Handler -- routes HTTP requests to capability + storage components (if web app)
+  4. Template -- generates HTML for user interaction (if web app)
+  5. Server -- starts HTTP server (if web app)
+
+A CLI app does not need Handler, Template, or Server. Do not add them.
+
+Return JSON matching the AppSpec schema."""
+
+        system = f"""You are a software architect designing minimal Python applications.
+The EXTRACTED INTENT block defines what the app must do. Your job is to design the components
+that implement it. Component [0] must always be the capability owner named in the intent."""
+
+        return call_ollama_structured(
+            model=cls.model,
+            prompt=prompt,
+            system=system,
+            response_schema=AppSpec,
+            temperature=cls.temperature
+        )
+
+    @classmethod
+    def _inject_capability_component(cls, spec: AppSpec, intent: IntentSpec) -> AppSpec:
+        """
+        Deterministically inject the missing capability component at index 0.
+        This is a safety net, not the happy path. It should log a warning every time
+        it fires -- consistent firing means the Phase 2 prompt needs adjustment.
+        """
+        capability_component = ComponentSpec(
+            name=intent.capability_owner,
+            responsibility=f"Implements the core capability: {intent.core_capability}",
+            output_file=f"outputs/{cls._pascal_to_snake(intent.capability_owner)}.py",
+            depends_on=[],
+            public_interface="execute(input: str) -> str"
+        )
+
+        # Insert at front, cap at 5 to avoid over-decomposition
+        new_components = [capability_component] + list(spec.components)
+        new_components = new_components[:5]
+
+        return AppSpec(
+            summary=spec.summary,
+            features=spec.features,
+            components=new_components,
+            done_criteria=spec.done_criteria
+        )
+
+    @staticmethod
+    def _pascal_to_snake(name: str) -> str:
+        return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()

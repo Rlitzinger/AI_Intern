@@ -4,6 +4,18 @@ from typing import Any, Literal, NamedTuple, Optional
 from uuid import uuid4
 
 
+class SubtaskSpec(BaseModel):
+    """
+    Structured subtask produced by the decomposer.
+    Replaces free-form goal strings with explicit agent routing intent.
+    """
+    agent_type: Literal["code", "research", "file"]
+    goal: str                           # Free-form natural language - rich description for the agent
+    input_files: list[str] = []         # Files from user_data/ this task needs (must exist)
+    output_file: Optional[str] = None   # File this task writes to outputs/ (if any)
+    depends_on: list[int] = []          # Indices of subtasks this depends on (0-indexed within siblings)
+
+
 class TaskOutput(BaseModel):
     """Structured output from a task, beyond just raw text."""
     output_type: Literal["text", "code", "data", "file_path", "error"] = "text"
@@ -41,6 +53,7 @@ class TaskSchema(BaseModel):
     depends_on: list[int] = []  # Task order values this depends on (#19)
     output_contract: Optional[dict] = None  # {component_name, output_file, public_interface}
     suggested_agent: Optional[str] = None   # "code", "research", "file", "analysis" — set by planner
+    declared_agent: Optional[Literal["code", "research", "file"]] = None  # Set from SubtaskSpec
     error_category: Optional[str] = None   # ErrorCategory value from error_classifier
 
 

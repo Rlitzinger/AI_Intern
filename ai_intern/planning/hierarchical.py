@@ -1,6 +1,7 @@
-from ..schemas import TaskSchema, PlanSchema, RequestSchema
+from ..schemas import TaskSchema, PlanSchema, RequestSchema, SubtaskSpec
 from .classifier import TaskClassifier, TaskVerdict
 from .spec_generator import SpecGenerator, AppSpec
+from .context import PlanningContext
 from ..llm import call_ollama_structured
 from ..config import settings
 from ..logging_config import get_logger
@@ -9,32 +10,29 @@ from pydantic import BaseModel, field_validator
 logger = get_logger("hierarchical")
 
 
-class SubtaskItem(BaseModel):
-    """One subtask with an agent annotation."""
-    goal: str
-    agent: str = "code"  # "code", "research", "file", "analysis"
-
-
 class DecompositionResult(BaseModel):
     """LLM response schema for task decomposition.
 
-    The LLM returns a list of dicts: [{"goal": "...", "agent": "..."}].
-    A field_validator normalises list[str] (old format) into list[SubtaskItem]
-    so we're backward-compatible if the 7B model returns the legacy format.
+    The LLM returns a list of SubtaskSpec dicts.
+    A field_validator handles legacy formats for backward compatibility.
     """
-    subtasks: list[SubtaskItem]
+    subtasks: list[SubtaskSpec]
 
     @field_validator("subtasks", mode="before")
     @classmethod
     def coerce_str_list(cls, v):
-        """Accept list[str] (legacy) or list[dict] (new format)."""
+        """Accept list[str] (legacy), list[dict] with 'agent' key (old), or new SubtaskSpec format."""
         if not isinstance(v, list):
             return v
         coerced = []
         for item in v:
             if isinstance(item, str):
-                coerced.append({"goal": item, "agent": "code"})
+                coerced.append({"agent_type": "code", "goal": item})
             elif isinstance(item, dict):
+                # Rename legacy 'agent' key to 'agent_type'
+                if "agent" in item and "agent_type" not in item:
+                    item = dict(item)
+                    item["agent_type"] = item.pop("agent")
                 coerced.append(item)
             else:
                 coerced.append(item)
@@ -88,6 +86,10 @@ class HierarchicalPlanner:
         env_prompt = env_ctx.to_prompt_block()
         logger.info(f"Environment: {len(env_ctx.available_files)} file(s) in user_data/")
 
+        # Build planning context (file list + agent roster) for structured decomposition
+        planning_context = PlanningContext.build()
+        logger.info(f"PlanningContext: {planning_context.available_files}")
+
         # Create root task from request
         root_task = TaskSchema(
             plan_id="placeholder",  # Will be set later
@@ -107,7 +109,8 @@ class HierarchicalPlanner:
         leaf_tasks, total_tokens = cls._decompose_recursive(
             task=root_task,
             depth=0,
-            context=shared_context
+            context=shared_context,
+            planning_context=planning_context
         )
 
         # Build plan from leaf tasks
@@ -138,7 +141,8 @@ class HierarchicalPlanner:
         cls,
         task: TaskSchema,
         depth: int,
-        context: dict
+        context: dict,
+        planning_context: PlanningContext = None
     ) -> tuple[list[TaskSchema], int]:
         """
         Recursively decompose task until all subtasks are executable.
@@ -163,7 +167,7 @@ class HierarchicalPlanner:
             return [task], 0
 
         # Classify the task (returns 4-tuple including is_app_scale)
-        verdict, reasoning, tokens, is_app_scale = TaskClassifier.classify(task, context)
+        verdict, reasoning, tokens, is_app_scale = TaskClassifier.classify(task, planning_context, context)
         total_tokens = tokens
 
         # Hybrid safety net: LLM OR conservative keyword match.
@@ -212,7 +216,7 @@ class HierarchicalPlanner:
 
             # Decompose into subtasks
             logger.info(f"{indent}Decomposing into subtasks...")
-            subtasks, decomp_tokens = cls._decompose_task(task, context)
+            subtasks, decomp_tokens = cls._decompose_task(task, context, planning_context)
             total_tokens += decomp_tokens
 
             # Recursively decompose each subtask
@@ -231,7 +235,8 @@ class HierarchicalPlanner:
                 leaf_tasks, sub_tokens = cls._decompose_recursive(
                     subtask,
                     depth + 1,
-                    subtask_context
+                    subtask_context,
+                    planning_context
                 )
                 all_leaf_tasks.extend(leaf_tasks)
                 total_tokens += sub_tokens
@@ -288,7 +293,7 @@ class HierarchicalPlanner:
                 context['root_clarified_goal'] = clarified_task.goal
 
             # Decompose the clarified task
-            subtasks, decomp_tokens = cls._decompose_task(clarified_task, context)
+            subtasks, decomp_tokens = cls._decompose_task(clarified_task, context, planning_context)
             total_tokens += decomp_tokens
 
             # Recursively decompose each subtask
@@ -306,7 +311,8 @@ class HierarchicalPlanner:
                 leaf_tasks, sub_tokens = cls._decompose_recursive(
                     subtask,
                     depth + 1,
-                    subtask_context
+                    subtask_context,
+                    planning_context
                 )
                 all_leaf_tasks.extend(leaf_tasks)
                 total_tokens += sub_tokens
@@ -314,9 +320,11 @@ class HierarchicalPlanner:
             return all_leaf_tasks, total_tokens
 
     @classmethod
-    def _decompose_task(cls, task: TaskSchema, context: dict) -> tuple[list[TaskSchema], int]:
+    def _decompose_task(
+        cls, task: TaskSchema, context: dict, planning_context: PlanningContext = None
+    ) -> tuple[list[TaskSchema], int]:
         """
-        Decompose a complex task into 2-3 subtasks.
+        Decompose a complex task into 2-4 subtasks with explicit agent declarations.
 
         If context contains an 'app_spec', uses a spec-aware prompt that maps
         each component to a concrete subtask goal.
@@ -330,108 +338,73 @@ class HierarchicalPlanner:
             return cls._decompose_task_from_spec(task, spec)
 
         # --- Standard path ---
-        # Surface environment context and clarified objective
-        env_block = context.get('environment', '')
-        root_goal = context.get('root_clarified_goal') or context.get('parent_goal')
-        objective_block = ""
-        if root_goal and root_goal != task.goal:
-            objective_block = f"Overall objective: {root_goal}\n\n"
+        # Build the available files block for the prompt
+        if planning_context and planning_context.available_files:
+            files_block = "Available files in user_data/:\n"
+            files_block += "\n".join(f"  - {f}" for f in planning_context.available_files)
+        else:
+            files_block = "Available files in user_data/: (none)"
 
-        env_header = f"{env_block}\n\n" if env_block else ""
-        prompt = f"""{env_header}{objective_block}Task to decompose: {task.goal}
+        prompt = f"""Task to decompose: {task.goal}
 
-This task is too complex to execute in one step. Break it into EXACTLY 2-3 subtasks. Never more than 3.
+{files_block}
 
-If the task seems to need more than 3 subtasks, you're over-decomposing.
-Combine related steps into single subtasks.
+Available agents (you MUST assign each subtask to exactly one):
+  [code]     CodingAgent: Writes Python functions and scripts. Cannot read/write files.
+  [research] ResearchAgent: Searches the web for facts and data. Cannot write code or files.
+  [file]     FileAgent: Reads from user_data/, writes to outputs/. Cannot write code or search web.
 
-AVAILABLE EXECUTION AGENTS — map each subtask to exactly one:
-- ResearchAgent  : web search and synthesis of information
-- CodingAgent    : writes a complete Python script/function (handles read + process + output in ONE task)
-- AnalysisAgent  : generates and runs analysis code against a file
-- FileAgent      : reads or writes files (CSV, txt, JSON)
+Break this task into 2-4 subtasks. Each subtask must be handled by exactly one agent.
 
-IMPORTANT: CodingAgent can read a file, process data, and output results all in a single task.
-Do NOT split "write a script that reads X, calculates Y, and prints Z" — that is ONE CodingAgent task.
-Only create separate tasks when different *agents* are genuinely needed.
+DECOMPOSITION RULES:
+1. File reads are always a separate [file] task FIRST
+2. Research is always a separate [research] task FIRST
+3. Code generation is a [code] task that uses results from prior tasks
+4. Saving results is always a separate [file] task LAST
+5. [code] tasks CANNOT read files - the [file] agent must read first and pass results via context
+6. Keep subtask goals rich and descriptive - the agent needs to understand what to do
 
-ANTI-HALLUCINATION RULES (CRITICAL):
+GOOD example:
+Task: "Read Workouts.csv and calculate average calories, save summary"
+-> subtask 0: agent=file, goal="Read Workouts.csv and return all rows with date, calories, duration columns", input_files=["Workouts.csv"]
+-> subtask 1: agent=code, goal="Calculate the average calories burned per workout from the CSV data passed in context. Return a formatted summary string.", depends_on=[0]
+-> subtask 2: agent=file, goal="Save the workout analysis summary from context to outputs/workout_summary.txt", output_file="workout_summary.txt", depends_on=[1]
 
-1. DO NOT create research tasks about basic programming operations
-   ❌ BAD: "Research how to read CSV files"
-   ✅ GOOD: "Read file Workouts.csv"
+BAD example (never do this):
+-> subtask 0: agent=research, goal="Research how to use pandas to read CSV files"   <- hallucinated
+-> subtask 1: agent=code, goal="Read Workouts.csv and calculate average"             <- code can't read files
 
-2. DO NOT create checking/validation/merging tasks unless explicitly requested
-   ❌ BAD: "Check if existing data available"
-   ❌ BAD: "Merge new data with existing DataFrame"
-   ✅ GOOD: Just do the requested operation directly
+Return a JSON object with a 'subtasks' array. Each subtask must have:
+- agent_type: one of "code", "research", "file"
+- goal: rich natural language description
+- input_files: list of filenames from user_data/ (only for file tasks that read)
+- output_file: filename for outputs/ (only for file tasks that write), or null
+- depends_on: list of subtask indices this depends on (empty if no dependencies)
 
-3. DO NOT add complexity that wasn't requested
-   ❌ BAD: Breaking "read CSV" into "research pandas → load file → validate → merge"
-   ✅ GOOD: One subtask = "Read file X.csv"
-
-4. ASSUME standard Python libraries are available (pandas, csv, json, yfinance, etc.)
-   - No need to research how to use them
-   - No need to check if they're installed
-
-5. File operations are SIMPLE:
-   - "Read X.csv" → ONE task, not 3-4 tasks
-   - "Save to Y.txt" → ONE task
-   - Don't decompose file I/O further
-
-CRITICAL DECOMPOSITION RULES:
-
-1. FILE OPERATIONS ARE ALWAYS SEPARATE TASKS:
-   - If goal mentions "save", "write to file", "output to", create a dedicated save task
-   - Example: "Research X and save as Y" → Task 1: Research X, Task 2: Save to Y
-
-2. RESEARCH + CODE ARE ALWAYS SEPARATE TASKS:
-   - If goal mentions research AND code generation, split them
-   - Example: "Research X and write code" → Task 1: Research X, Task 2: Write code using results
-
-3. EXECUTION ORDER MATTERS:
-   - Research tasks come first (gather data)
-   - Code/analysis tasks come second (process data)
-   - File save tasks come last (store results)
-
-Each subtask should:
-- Be independently executable by a single agent
-- Have a clear, single purpose
-- Reference previous tasks if needed ("using results from previous task")
-
-GOOD DECOMPOSITION:
-"Read Workouts.csv and calculate average calories, save summary"
-→ [
-    "Read file Workouts.csv",
-    "Calculate average calories from the workout data",
-    "Save the analysis summary to outputs/workout_summary.txt"
-  ]
-
-BAD DECOMPOSITION (hallucinated complexity):
-"Read Workouts.csv and calculate average calories, save summary"
-→ [
-    "Research how to read CSV files",  <- Unnecessary
-    "Load Workouts.csv using pandas",  <- Just say "Read file"
-    "Check for existing data",         <- Not requested
-    "Merge with existing data",        <- Hallucinated
-    "Calculate calories",
-    "Save summary"
-  ]
-
-For each subtask, specify which agent should handle it:
-- "research": web search and information gathering
-- "code": write Python code (functions, scripts, classes)
-- "file": read or write files (CSV, JSON, TXT)
-- "analysis": data analysis (calculate, aggregate, statistics using pandas/code)
-
-Return a JSON object with a 'subtasks' array of objects, each with "goal" and "agent".
-
-Example:
+Example JSON:
 {{
   "subtasks": [
-    {{"goal": "Read file Workouts.csv", "agent": "file"}},
-    {{"goal": "Calculate average calories from the workout data", "agent": "analysis"}},
-    {{"goal": "Save the analysis summary to outputs/workout_summary.txt", "agent": "file"}}
+    {{
+      "agent_type": "file",
+      "goal": "Read Workouts.csv and return all workout records with date, calories burned, and duration",
+      "input_files": ["Workouts.csv"],
+      "output_file": null,
+      "depends_on": []
+    }},
+    {{
+      "agent_type": "code",
+      "goal": "Using the workout records from context, calculate average calories burned per session and format as a readable summary",
+      "input_files": [],
+      "output_file": null,
+      "depends_on": [0]
+    }},
+    {{
+      "agent_type": "file",
+      "goal": "Save the workout summary from context to outputs/workout_summary.txt",
+      "input_files": [],
+      "output_file": "workout_summary.txt",
+      "depends_on": [1]
+    }}
   ]
 }}
 """
@@ -439,15 +412,15 @@ Example:
         result, tokens = call_ollama_structured(
             model=cls.model,
             prompt=prompt,
-            system="You are a task decomposition expert. Break complex tasks into clear, actionable subtasks.",
+            system="You are a task decomposition expert. Break tasks into subtasks, each handled by exactly one agent. Never create research tasks about programming tools or libraries.",
             response_schema=DecompositionResult,
             temperature=cls.temperature
         )
 
-        # Enforce max 3 subtasks
-        if len(result.subtasks) > 3:
-            logger.warning(f"Decomposer returned {len(result.subtasks)} subtasks, truncating to 3")
-            result.subtasks = result.subtasks[:3]
+        # Enforce max 4 subtasks
+        if len(result.subtasks) > 4:
+            logger.warning(f"Decomposer returned {len(result.subtasks)} subtasks, truncating to 4")
+            result.subtasks = result.subtasks[:4]
 
         # Sanity check: Filter out hallucinated research/checking tasks
         skip_keywords = [
@@ -459,25 +432,25 @@ Example:
             "validate data",
             "verify that",
         ]
-        filtered_items = []
-        for item in result.subtasks:
-            goal_lower = item.goal.lower()
+        filtered_specs = []
+        for spec in result.subtasks:
+            goal_lower = spec.goal.lower()
             if any(kw in goal_lower for kw in skip_keywords):
-                logger.warning(f"Filtering hallucinated task: {item.goal[:50]}...")
+                logger.warning(f"Filtering hallucinated task: {spec.goal[:50]}...")
                 continue
-            filtered_items.append(item)
+            filtered_specs.append(spec)
 
-        if len(filtered_items) < len(result.subtasks):
-            logger.warning(f"Filtered {len(result.subtasks) - len(filtered_items)} hallucinated task(s)")
+        if len(filtered_specs) < len(result.subtasks):
+            logger.warning(f"Filtered {len(result.subtasks) - len(filtered_specs)} hallucinated task(s)")
 
-        # Convert to TaskSchema with agent annotation
+        # Convert SubtaskSpec objects to TaskSchema with declared_agent
         subtasks = []
-        for i, item in enumerate(filtered_items):
+        for i, spec in enumerate(filtered_specs):
             task_obj = TaskSchema(
                 plan_id="placeholder",
                 task_order=i,
-                goal=item.goal,
-                suggested_agent=item.agent if item.agent else None,
+                goal=spec.goal,
+                declared_agent=spec.agent_type,
             )
             subtasks.append(task_obj)
 
