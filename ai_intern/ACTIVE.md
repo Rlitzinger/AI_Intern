@@ -1,360 +1,233 @@
-# ACTIVE TASK: SpecGenerator — Intent-First Redesign
+# ACTIVE TASK: SpecGenerator — Two Targeted Fixes
 
-## Problem Statement
+## What This Fixes
 
-The SpecGenerator currently produces architecturally valid but functionally hollow specs.
-Given "build a web app that allows users to turn their written art ideas into a picture",
-it returns a standard CRUD stack (Store, Model, Handler, Template, Server) with no image
-generation component. The user's primary objective — turning text into a picture — never
-appears in any component.
+Two specific issues identified from live output analysis:
 
-Root cause: The generator does one LLM call that simultaneously extracts intent AND designs
-architecture. At 7B scale, the model pattern-matches to "web app → standard stack" before
-it fully processes what the app must DO. Intent gets lost inside structural generation.
+1. **PascalCase output filenames** — `ComponentSpec.output_file` returns `outputs/ImageCropper.py`
+   instead of `outputs/image_cropper.py`. The `_pascal_to_snake()` method exists but only runs
+   inside `_inject_capability_component()` (the safety net). The happy path has no enforcement.
+   This will cause import failures on Linux/Mac (case-sensitive filesystems).
 
-The fix is NOT a prompt addition. It is a structural split: two focused LLM calls where
-the second is explicitly grounded by the output of the first.
+2. **Tautological `core_capability`** — `_extract_intent()` returned "implement image cropping
+   functionality" for a request about cropping images. This restates the action rather than naming
+   the mechanism. The `_design_components()` prompt then received this as ground truth and produced
+   a generic `execute(input: str) -> str` interface instead of `crop(image_path: str, box: tuple) -> str`.
 
----
-
-## Mental Model
-
-### Current (broken)
-```
-User request
-  → [LLM Call: "generate AppSpec"] ← does everything at once
-  → AppSpec with components         ← architecture, no intent guarantee
-```
-
-### Target
-```
-User request
-  → [LLM Call 1: "extract intent"]  ← focused, flat schema
-  → IntentSpec                       ← primary action, core capability, constraints
-      |
-      ↓ (injected into prompt)
-  → [LLM Call 2: "design components grounded in intent"]
-  → AppSpec                          ← architecture derived FROM intent
-```
-
-IntentSpec is never exposed to the orchestrator or agents. It is internal scaffolding
-that exists only to ground Call 2. Think of it as a chain-of-thought that is structured
-rather than free-form.
+Both fixes are in one file: `ai_intern/planning/spec_generator.py`
 
 ---
 
-## Why Two Calls Instead of a Better Prompt
+## Fix 1: Enforce snake_case on `ComponentSpec.output_file`
 
-One-call approaches fail here for a specific reason: the model must satisfy two competing
-objectives simultaneously — understand what the user wants AND produce a valid nested JSON
-structure. At 7B scale these compete for the same attention budget. Structural generation
-wins because it is the dominant pattern in training data.
+### Problem
 
-Splitting the calls eliminates the competition:
-- Call 1 is unconstrained on structure (flat schema, short output) — the model can focus
-  entirely on understanding intent
-- Call 2 receives the intent as a completed fact in the prompt — it cannot ignore it
-  because it is the first thing the model reads
+`ComponentSpec.output_file` has no validator. The Phase 2 prompt says to use snake_case
+but the model ignores it. There is no enforcement layer.
 
-This is strictly more reliable than any prompt engineering approach because it makes
-intent-ignorance architecturally impossible, not just instructionally discouraged.
+`_pascal_to_snake()` already exists as a static method on `SpecGenerator` — it is just
+never called on the happy path.
 
-Token cost: ~400-600 extra tokens per app-scale request. Acceptable given that this path
-only fires for app-scale requests, and the quality delta is significant.
+### Solution
 
----
+Add a `field_validator` to `ComponentSpec` that normalises the path at Pydantic parse time.
+Extract the conversion logic into a module-level function `_to_snake_case()` so both
+`ComponentSpec` and `SpecGenerator._pascal_to_snake()` share one implementation.
 
-## New Schema: IntentSpec
+### Exact Changes
 
-### File: `ai_intern/planning/spec_generator.py`
-
-Add `IntentSpec` BEFORE `AppSpec`. This is Call 1's response schema.
+**Step 1** — Add a module-level helper directly after the imports, before any class definitions:
 
 ```python
-class IntentSpec(BaseModel):
+def _to_snake_case(name: str) -> str:
+    """Convert PascalCase or mixed-case string to snake_case.
+
+    Handles simple cases (ImageCropper -> image_cropper) and
+    consecutive-uppercase acronyms (HTTPServer -> http_server).
     """
-    Extracted user intent. Internal scaffolding only — never stored on plan or task.
-    Exists only to ground the component design in Call 2.
-    """
-    primary_action: str
-    # The ONE thing the user must be able to do, written as an active verb phrase.
-    # Examples:
-    #   "turn written text into a generated image"
-    #   "track daily workouts and view progress over time"
-    #   "store and retrieve personal notes with search"
-    # NOT "build a web app" — that describes the container, not the action.
-
-    core_capability: str
-    # The specific technical mechanism that makes primary_action possible.
-    # Name the specific technology or algorithm required.
-    # Examples:
-    #   "call an image generation API (e.g. Stable Diffusion, DALL-E, or Replicate)"
-    #   "persist workout records to SQLite and compute aggregate stats"
-    #   "full-text search over stored note content"
-    # If the request doesn't specify, name the most appropriate option and note it's assumed.
-
-    capability_owner: str
-    # The PascalCase name of the component that must own core_capability.
-    # This component MUST appear in the final AppSpec.
-    # Examples: "ImageGenerator", "WorkoutTracker", "NoteSearchEngine"
-
-    constraints: list[str]
-    # Explicit constraints from the user's request (platform, language, format, etc.)
-    # Leave empty list if none stated. Do NOT invent constraints.
-    # Examples: ["web app (HTTP server)", "Python only", "no external database"]
+    # Insert underscore before an uppercase letter that follows a lowercase letter or digit
+    s = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', name)
+    # Insert underscore before an uppercase letter that is followed by a lowercase letter
+    # when it is itself preceded by an uppercase letter  (handles "HTTPServer" -> "HTTP_Server")
+    s = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', '_', s)
+    return s.lower()
 ```
 
-Keep this schema flat. No nested objects. Four fields, all strings or list[str].
-The model must fill this reliably in one shot — complexity here defeats the purpose.
+Verify: `_to_snake_case("HTTPServer") == "http_server"` and
+`_to_snake_case("ImageCropper") == "image_cropper"` before committing.
+
+**Step 2** — Add a `field_validator` to `ComponentSpec`.
+Also add `field_validator` to the import from pydantic if not already present.
+
+```python
+from pydantic import BaseModel, field_validator
+
+class ComponentSpec(BaseModel):
+    name: str           # PascalCase — do NOT normalise this field
+    responsibility: str
+    output_file: str
+    depends_on: list[str] = []
+    public_interface: str
+
+    @field_validator("output_file", mode="before")
+    @classmethod
+    def normalise_output_file(cls, v: str) -> str:
+        """
+        Enforce outputs/<snake_case_name>.py regardless of what the LLM returns.
+
+        Handles:
+          "outputs/ImageCropper.py"   -> "outputs/image_cropper.py"
+          "ImageCropper.py"           -> "outputs/image_cropper.py"
+          "outputs/image_cropper.py"  -> "outputs/image_cropper.py"  (no-op)
+          "outputs/HTTPServer.py"     -> "outputs/http_server.py"
+        """
+        if not isinstance(v, str):
+            return v
+
+        # Normalise path separators, extract filename only
+        filename = v.replace("\\", "/").split("/")[-1]
+
+        # Strip extension
+        stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+
+        # Convert stem to snake_case and rebuild canonical path
+        return f"outputs/{_to_snake_case(stem)}.py"
+```
+
+**Step 3** — Update `SpecGenerator._pascal_to_snake()` to delegate to the shared function:
+
+```python
+@staticmethod
+def _pascal_to_snake(name: str) -> str:
+    return _to_snake_case(name)
+```
+
+### What Changes in Practice
+
+The fix happens at Pydantic parse time — before `_decompose_task_from_spec` builds the
+task goal string. No changes needed anywhere downstream.
+
+Before:
+```
+output_file: "outputs/ImageCropper.py"
+goal: "Write `outputs/ImageCropper.py` Python module."
+```
+
+After:
+```
+output_file: "outputs/image_cropper.py"
+goal: "Write `outputs/image_cropper.py` Python module."
+```
 
 ---
 
-## Updated SpecGenerator: Two-Phase `generate()`
+## Fix 2: Force Concrete `core_capability` in `_extract_intent`
 
-### File: `ai_intern/planning/spec_generator.py`
+### Problem
 
-Replace the current `generate()` method with the following structure.
-Do not change `AppSpec`, `ComponentSpec`, or any method not listed here.
+The model satisfies the schema with tautological values:
+- "implement image cropping functionality"  — restates the action
+- "handle user authentication"             — describes the layer, not the mechanism
+- "store user data"                        — meaningless
 
-### `generate()` — orchestrates both phases
+These pass schema validation but give `_design_components` nothing actionable. The
+downstream effect is generic interfaces like `execute(input: str) -> str`.
 
-```python
-@classmethod
-def generate(cls, task: TaskSchema, context: dict) -> tuple[AppSpec, int]:
-    """
-    Two-phase spec generation.
-    Phase 1: Extract user intent (IntentSpec) — flat schema, low temperature.
-    Phase 2: Design components grounded in intent — IntentSpec injected as ground truth.
-    """
-    total_tokens = 0
+The current prompt gives one good example (image generation API) but a 7B model
+generalises poorly from one example. It matches the surface form of the schema field
+without matching the substance.
 
-    # Phase 1: Intent extraction
-    intent, tokens_1 = cls._extract_intent(task.goal)
-    total_tokens += tokens_1
+### Solution
 
-    # Log intent so failures are visible immediately
-    print(f"      🎯 Primary action:   {intent.primary_action}")
-    print(f"      ⚙️  Core capability:  {intent.core_capability}")
-    print(f"      🏗️  Capability owner: {intent.capability_owner}  <- must appear in components")
+**Change A** — Rewrite the `core_capability` instruction block with matched BAD/GOOD pairs
+that show the exact failure mode. Add a curated list of standard library defaults so the
+model has concrete options when the user hasn't specified one.
 
-    # Phase 2: Component design grounded in intent
-    spec, tokens_2 = cls._design_components(task.goal, intent)
-    total_tokens += tokens_2
+Replace the existing `core_capability` block in `_extract_intent`'s prompt:
 
-    # Safety net: verify capability_owner appears in components
-    component_names = [c.name for c in spec.components]
-    if intent.capability_owner not in component_names:
-        print(f"      ⚠️  WARNING: capability_owner '{intent.capability_owner}' missing from {component_names}")
-        print(f"      ⚠️  Injecting missing component deterministically...")
-        spec = cls._inject_capability_component(spec, intent)
-
-    return spec, total_tokens
 ```
-
-### `_extract_intent()` — Phase 1 LLM call
-
-```python
-@classmethod
-def _extract_intent(cls, goal: str) -> tuple[IntentSpec, int]:
-    prompt = f"""User request: {goal}
-
-Extract the user's intent from this request.
-
-primary_action: The ONE thing the user must be able to DO.
-  - Write as an active verb phrase ("turn text into an image", "track workouts")
-  - Describe the ACTION, not the container ("web app" and "system" are containers, not actions)
-  - If the request says "turn X into Y", primary_action is exactly "turn X into Y"
-
+# BEFORE
 core_capability: The specific technical mechanism that makes primary_action possible.
   - Name the algorithm, API, or data operation required
   - Be concrete: "call image generation API (e.g. Stable Diffusion)" not "handle user input"
   - If multiple options exist, pick the most appropriate and note it is assumed
 
-capability_owner: The PascalCase component name that will own core_capability.
-  - This component MUST be created in the final application
-  - Name it after what it does, not what layer it is: "ImageGenerator" not "Handler"
-
-constraints: List only explicit requirements from the user's request.
-  - Empty list if none stated. Do NOT invent constraints.
-
-Return JSON matching the IntentSpec schema."""
-
-    system = """You are an intent extraction expert.
-Your job is to identify what a user actually needs an application to DO.
-Focus entirely on the primary user action. Ignore architecture and implementation layers."""
-
-    return call_ollama_structured(
-        model=cls.model,
-        prompt=prompt,
-        system=system,
-        response_schema=IntentSpec,
-        temperature=0.1  # Intentionally low — extraction is deterministic
-    )
+# AFTER
+core_capability: The specific Python library, function, or API that implements primary_action.
+  - MUST name a concrete library or API call — never describe behavior in general terms
+  - BAD:  "implement image cropping functionality"    <- restates action, names nothing
+  - GOOD: "use Pillow's Image.crop(box) where box=(left, upper, right, lower)"
+  - BAD:  "handle HTTP requests for the web app"     <- describes layer, names nothing
+  - GOOD: "use Python's http.server.BaseHTTPRequestHandler to route GET/POST requests"
+  - BAD:  "store user data on disk"                  <- describes behavior, names nothing
+  - GOOD: "persist records as JSON using Python's built-in json module"
+  - BAD:  "generate images based on user input"      <- describes behavior, names nothing
+  - GOOD: "call the Replicate API with the user's prompt to generate an image (assumed: Replicate)"
+  - If the user did not specify a library, choose the most appropriate from this list and note it:
+      Images:      Pillow (PIL)
+      Database:    sqlite3
+      Simple data: json module
+      Tabular:     csv module
+      HTTP client: requests
+      HTTP server: http.server.BaseHTTPRequestHandler
+      Image gen:   Replicate API or Stable Diffusion (local)
 ```
 
-### `_design_components()` — Phase 2 LLM call
+**Change B** — Lower temperature from 0.1 to 0.0 on this call. Intent extraction is
+deterministic — there is one correct primary action for any given request.
 
 ```python
-@classmethod
-def _design_components(cls, goal: str, intent: IntentSpec) -> tuple[AppSpec, int]:
+# BEFORE
+temperature=0.1  # Intentionally low — extraction is deterministic
 
-    constraints_block = (
-        "Constraints from user:\n" + "\n".join(f"  - {c}" for c in intent.constraints)
-        if intent.constraints
-        else "Constraints: None stated — use simplest reasonable defaults."
-    )
-
-    prompt = f"""User request: {goal}
-
-EXTRACTED INTENT — treat this as ground truth, not a suggestion:
-  Primary action:    {intent.primary_action}
-  Core capability:   {intent.core_capability}
-  Capability owner:  {intent.capability_owner}
-{constraints_block}
-
-Design the application components.
-
-HARD RULES:
-1. {intent.capability_owner} MUST be component [0]. It implements: {intent.core_capability}
-2. Every other component exists to SUPPORT {intent.capability_owner}
-3. 3-5 components total. Each must be implementable in under 50 lines of Python.
-4. output_file must follow pattern: "outputs/<snake_case_name>.py"
-5. depends_on lists component NAMES (PascalCase), not file paths
-6. public_interface lists exact Python signatures only, nothing else
-
-Suggested component order (omit any that are not needed for this specific app):
-  1. {intent.capability_owner} — REQUIRED — implements {intent.core_capability}
-  2. Storage — persists data to disk (if the app needs persistence)
-  3. Handler — routes HTTP requests to capability + storage components (if web app)
-  4. Template — generates HTML for user interaction (if web app)
-  5. Server — starts HTTP server (if web app)
-
-A CLI app does not need Handler, Template, or Server. Do not add them.
-
-Return JSON matching the AppSpec schema."""
-
-    system = """You are a software architect designing minimal Python applications.
-The EXTRACTED INTENT block defines what the app must do. Your job is to design the components
-that implement it. Component [0] must always be the capability owner named in the intent."""
-
-    return call_ollama_structured(
-        model=cls.model,
-        prompt=prompt,
-        system=system,
-        response_schema=AppSpec,
-        temperature=cls.temperature
-    )
+# AFTER
+temperature=0.0  # Greedy decoding — extraction is fully deterministic
 ```
 
-### `_inject_capability_component()` — deterministic safety net
+If `call_ollama_structured` raises on `temperature=0.0`, use `0.05` and add a comment.
 
-Only called when the LLM ignored the capability_owner constraint. No LLM call.
+### Expected Output Delta
 
-```python
-@classmethod
-def _inject_capability_component(cls, spec: AppSpec, intent: IntentSpec) -> AppSpec:
-    """
-    Deterministically inject the missing capability component at index 0.
-    This is a safety net, not the happy path. It should log a warning every time
-    it fires — consistent firing means the Phase 2 prompt needs adjustment.
-    """
-    capability_component = ComponentSpec(
-        name=intent.capability_owner,
-        responsibility=f"Implements the core capability: {intent.core_capability}",
-        output_file=f"outputs/{cls._pascal_to_snake(intent.capability_owner)}.py",
-        depends_on=[],
-        public_interface="execute(input: str) -> str"
-    )
-
-    # Insert at front, cap at 5 to avoid over-decomposition
-    new_components = [capability_component] + list(spec.components)
-    new_components = new_components[:5]
-
-    return AppSpec(
-        summary=spec.summary,
-        features=spec.features,
-        components=new_components,
-        done_criteria=spec.done_criteria
-    )
-
-@staticmethod
-def _pascal_to_snake(name: str) -> str:
-    import re
-    return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
+Before:
 ```
+[Intent] Core capability:  implement image cropping functionality
+→ Component [0] interface: execute(input: str) -> str
+```
+
+After:
+```
+[Intent] Core capability:  use Pillow's Image.crop(box) where box=(left, upper, right, lower)
+→ Component [0] interface: crop(image_path: str, box: tuple) -> str
+```
+
+The CodingAgent receives the concrete interface in its task goal and can write correct
+Pillow code without having to infer what "implement cropping" means.
 
 ---
 
-## Logging
-
-The diagnostic tool (`plan.py`) already shows spec components. Add intent logging
-immediately after `SpecGenerator.generate()` returns, before the component list prints.
-
-Add this block in `plan.py` (or wherever the spec is displayed after generation):
-
-```python
-# After SpecGenerator.generate() is called inside the planning walk-through
-if spec:
-    print(f"\n      Intent (Phase 1 output):")
-    print(f"        Primary action:   {intent_logged_from_generate}")
-    print(f"        Core capability:  ...")
-    print(f"        Capability owner: ...")
-```
-
-The `generate()` method already prints this via the inline print statements.
-No additional changes to `plan.py` are needed unless you want to surface IntentSpec
-fields in the Step 3 full-plan output.
-
----
-
-## Validation Tests
+## Validation
 
 ```bash
+python plan.py "build a web app that allows users to crop images"
 python plan.py "build a web app that allows users to turn their written art ideas into a picture"
-python plan.py "build a CLI tool to track daily workouts and show weekly averages"
 python plan.py "build a note-taking app with save, load, and search"
-python plan.py "write a fibonacci function"
 ```
 
-### Pass criteria
+### Pass Criteria
 
-For the art ideas request:
-- [ ] Intent log shows `primary_action` as "turn written text into a generated image" (or equivalent)
-- [ ] Intent log shows `capability_owner` as "ImageGenerator" (or equivalent — not "Handler")
-- [ ] Component [0] in AppSpec is ImageGenerator with interface `generate(prompt: str) -> ...`
-- [ ] No other component has responsibility that duplicates image generation
-- [ ] Safety net injection NOT triggered (warning should not appear)
+**Fix 1 — snake_case filenames:**
+- [ ] All `output_file` values are `outputs/snake_case_name.py` — no uppercase after `outputs/`
+- [ ] `ImageCropper` → `outputs/image_cropper.py`
+- [ ] `ArtIdeaServer` → `outputs/art_idea_server.py`
+- [ ] If a component named `HTTPServer` appears → `outputs/http_server.py` (acronym case)
+- [ ] Goal strings in task list reflect corrected filenames
 
-For the fibonacci request:
-- [ ] SpecGenerator is NOT called (not app-scale — verify via token count staying low)
-
-For all app-scale requests:
-- [ ] Token count is 3000-6000 (two calls, not runaway)
-- [ ] Component count is 3-5 (not over-decomposed)
-- [ ] Every component has a non-empty `public_interface`
-- [ ] Safety net injection logged as WARNING if it fires
-
-## Implementation Status
-
-- [x] `IntentSpec` schema added (flat, 4 fields)
-- [x] `SpecGenerator` converted to classmethod-based with `model`/`temperature` class attrs
-- [x] `generate()` replaced with two-phase orchestrator
-- [x] `_extract_intent()` added (Phase 1, temperature=0.1)
-- [x] `_design_components()` added (Phase 2, grounded in intent)
-- [x] `_inject_capability_component()` added (deterministic safety net with WARNING logs)
-- [x] `_pascal_to_snake()` added
-- [x] Import check passes — ready for live validation tests
-
----
-
-## What NOT to Change
-
-- `AppSpec` schema — downstream decomposition code depends on this shape exactly
-- `ComponentSpec` schema — same reason
-- `HierarchicalPlanner._decompose_task_from_spec()` — consumes AppSpec unchanged
-- `TaskClassifier` — app-scale detection is working correctly
-- `plan.py` diagnostic output structure — only add intent logging, do not restructure
-- Any file not listed in the Files to Change section
+**Fix 2 — concrete core_capability:**
+- [ ] Cropping request: `[Intent] Core capability` mentions Pillow and `Image.crop`
+- [ ] Art ideas request: capability mentions a named image generation API
+- [ ] Note-taking request: capability mentions `json`, `sqlite3`, or equivalent by name
+- [ ] Component [0] interface is domain-specific, not `execute(input: str) -> str`
+- [ ] No `core_capability` value ends with the word "functionality"
 
 ---
 
@@ -362,24 +235,24 @@ For all app-scale requests:
 
 | File | Change |
 |------|--------|
-| `ai_intern/planning/spec_generator.py` | Add `IntentSpec` schema; replace `generate()` with two-phase version; add `_extract_intent()`, `_design_components()`, `_inject_capability_component()`, `_pascal_to_snake()` |
+| `ai_intern/planning/spec_generator.py` | Add `_to_snake_case()` module-level function; add `field_validator` to `ComponentSpec`; update `_extract_intent` prompt `core_capability` block; change temperature to `0.0`; update `_pascal_to_snake()` to delegate to `_to_snake_case()` |
 
-That is all. One file. The fix is entirely self-contained within the spec generator.
+One file. No schema changes. No changes to `hierarchical.py`, `schemas.py`, or any other file.
 
 ---
 
 ## Notes for Claude Code
 
-The safety net (`_inject_capability_component`) must log a warning every time it fires.
-If it fires consistently, that signals the Phase 2 prompt needs adjustment — do not
-silently mask the failure.
+The two regex substitutions in `_to_snake_case` must run in sequence — the second only
+makes sense after the first has run. Do not combine them into one pattern.
 
-`temperature=0.1` on `_extract_intent` is intentional and must not be changed. Intent
-extraction is deterministic — "turn art ideas into a picture" has one correct primary
-action. Higher temperatures introduce noise into the one input that grounds everything else.
+Do not normalise `ComponentSpec.name` — it stays PascalCase. `name` is used in
+`depends_on` references and in goal strings where PascalCase is intentional and correct.
+Only `output_file` gets normalised.
 
-`IntentSpec` must stay flat. If you find yourself wanting to add nested objects to it,
-you are solving a different problem. It is scaffolding, not a data model.
+The `normalise_output_file` validator uses `mode="before"` so it runs on the raw LLM
+string before any other Pydantic coercion. This is correct — do not change the mode.
 
-Do not merge `_extract_intent` and `_design_components` back into one call. The separation
-is the fix, not an implementation detail.
+If the safety net (`_inject_capability_component`) fires after these changes, its
+`output_file` construction already calls `_pascal_to_snake()` which now delegates to
+`_to_snake_case()` — so the safety net path is also fixed automatically.

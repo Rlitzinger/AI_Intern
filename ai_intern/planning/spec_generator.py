@@ -1,11 +1,25 @@
 import re
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from ..llm import call_ollama_structured
 from ..config import settings
 from ..logging_config import get_logger
 from ..schemas import TaskSchema
 
 logger = get_logger("spec_generator")
+
+
+def _to_snake_case(name: str) -> str:
+    """Convert PascalCase or mixed-case string to snake_case.
+
+    Handles simple cases (ImageCropper -> image_cropper) and
+    consecutive-uppercase acronyms (HTTPServer -> http_server).
+    """
+    # Insert underscore before an uppercase letter that follows a lowercase letter or digit
+    s = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', name)
+    # Insert underscore before an uppercase letter that is followed by a lowercase letter
+    # when it is itself preceded by an uppercase letter  (handles "HTTPServer" -> "HTTP_Server")
+    s = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', '_', s)
+    return s.lower()
 
 
 class IntentSpec(BaseModel):
@@ -42,12 +56,36 @@ class IntentSpec(BaseModel):
 
 
 class ComponentSpec(BaseModel):
-    name: str           # e.g. "NoteStorage", "NoteAPI", "CLI"
+    name: str           # e.g. "NoteStorage", "NoteAPI", "CLI"  -- stays PascalCase
     responsibility: str # One sentence: what this component does
     output_file: str    # Where this component will be written, e.g. "outputs/storage.py"
     depends_on: list[str] = []  # Names of other components this one imports/uses
     public_interface: str  # Key functions/classes this exposes, plain English
                            # e.g. "save(note), load(id), delete(id), list_all()"
+
+    @field_validator("output_file", mode="before")
+    @classmethod
+    def normalise_output_file(cls, v: str) -> str:
+        """
+        Enforce outputs/<snake_case_name>.py regardless of what the LLM returns.
+
+        Handles:
+          "outputs/ImageCropper.py"   -> "outputs/image_cropper.py"
+          "ImageCropper.py"           -> "outputs/image_cropper.py"
+          "outputs/image_cropper.py"  -> "outputs/image_cropper.py"  (no-op)
+          "outputs/HTTPServer.py"     -> "outputs/http_server.py"
+        """
+        if not isinstance(v, str):
+            return v
+
+        # Normalise path separators, extract filename only
+        filename = v.replace("\\", "/").split("/")[-1]
+
+        # Strip extension
+        stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+
+        # Convert stem to snake_case and rebuild canonical path
+        return f"outputs/{_to_snake_case(stem)}.py"
 
 
 class AppSpec(BaseModel):
@@ -116,10 +154,24 @@ primary_action: The ONE thing the user must be able to DO.
   - Describe the ACTION, not the container ("web app" and "system" are containers, not actions)
   - If the request says "turn X into Y", primary_action is exactly "turn X into Y"
 
-core_capability: The specific technical mechanism that makes primary_action possible.
-  - Name the algorithm, API, or data operation required
-  - Be concrete: "call image generation API (e.g. Stable Diffusion)" not "handle user input"
-  - If multiple options exist, pick the most appropriate and note it is assumed
+core_capability: The specific Python library, function, or API that implements primary_action.
+  - MUST name a concrete library or API call — never describe behavior in general terms
+  - BAD:  "implement image cropping functionality"    <- restates action, names nothing
+  - GOOD: "use Pillow's Image.crop(box) where box=(left, upper, right, lower)"
+  - BAD:  "handle HTTP requests for the web app"     <- describes layer, names nothing
+  - GOOD: "use Python's http.server.BaseHTTPRequestHandler to route GET/POST requests"
+  - BAD:  "store user data on disk"                  <- describes behavior, names nothing
+  - GOOD: "persist records as JSON using Python's built-in json module"
+  - BAD:  "generate images based on user input"      <- describes behavior, names nothing
+  - GOOD: "call the Replicate API with the user's prompt to generate an image (assumed: Replicate)"
+  - If the user did not specify a library, choose the most appropriate from this list and note it:
+      Images:      Pillow (PIL)
+      Database:    sqlite3
+      Simple data: json module
+      Tabular:     csv module
+      HTTP client: requests
+      HTTP server: http.server.BaseHTTPRequestHandler
+      Image gen:   Replicate API or Stable Diffusion (local)
 
 capability_owner: The PascalCase component name that will own core_capability.
   - This component MUST be created in the final application
@@ -139,7 +191,7 @@ Focus entirely on the primary user action. Ignore architecture and implementatio
             prompt=prompt,
             system=system,
             response_schema=IntentSpec,
-            temperature=0.1  # Intentionally low — extraction is deterministic
+            temperature=0.0  # Greedy decoding — extraction is fully deterministic
         )
 
     @classmethod
@@ -219,4 +271,4 @@ that implement it. Component [0] must always be the capability owner named in th
 
     @staticmethod
     def _pascal_to_snake(name: str) -> str:
-        return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
+        return _to_snake_case(name)
