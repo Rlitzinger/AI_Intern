@@ -1,8 +1,9 @@
-import requests
+from typing import Type
+from pydantic import BaseModel
+from llama_cpp import Llama
+from outlines.models.llamacpp import LlamaCpp as OutlinesLlamaCpp
+from outlines.generator import Generator as OutlinesGenerator
 import json
-import time
-from typing import Any, Type
-from pydantic import BaseModel, ValidationError
 from .config import settings
 from .logging_config import get_logger
 
@@ -10,149 +11,164 @@ logger = get_logger("llm")
 
 
 class OllamaConnectionError(Exception):
-    """Raised when Ollama is not reachable."""
+    """Kept for compatibility. Raised when model cannot load."""
     pass
 
 
 class OllamaTimeoutError(Exception):
-    """Raised when an Ollama request times out."""
+    """Kept for compatibility."""
     pass
 
 
-def check_ollama_available() -> bool:
-    """Ping Ollama to check if it's running. Returns True/False."""
-    try:
-        response = requests.get(
-            f"{settings.OLLAMA_BASE_URL}/api/tags",
-            timeout=5
+class LlamaLoadError(Exception):
+    """Raised when llama-cpp-python model fails to load."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Lazy model singletons
+# ---------------------------------------------------------------------------
+
+_instruct_model: Llama | None = None
+_coder_model: Llama | None = None
+
+
+def _get_instruct_model() -> Llama:
+    global _instruct_model
+    if _instruct_model is None:
+        logger.info(f"Loading instruct model: {settings.LLAMA_MODEL_PATH}")
+        _instruct_model = Llama(
+            model_path=settings.LLAMA_MODEL_PATH,
+            n_gpu_layers=settings.LLAMA_N_GPU_LAYERS,
+            n_ctx=settings.LLAMA_N_CTX,
+            n_threads=settings.LLAMA_N_THREADS,
+            verbose=settings.LLAMA_VERBOSE,
         )
-        return response.status_code == 200
-    except (requests.ConnectionError, requests.Timeout):
-        return False
+        logger.info("Instruct model loaded successfully")
+    return _instruct_model
 
 
-def _post_with_retry(url: str, payload: dict, timeout: int = None) -> requests.Response:
-    """POST to Ollama with timeout, connection error handling, and retry on transient errors."""
-    if timeout is None:
-        timeout = settings.LLM_CALL_TIMEOUT
+def _get_coder_model() -> Llama:
+    global _coder_model
+    if _coder_model is None:
+        logger.info(f"Loading coder model: {settings.LLAMA_CODER_MODEL_PATH}")
+        _coder_model = Llama(
+            model_path=settings.LLAMA_CODER_MODEL_PATH,
+            n_gpu_layers=settings.LLAMA_N_GPU_LAYERS,
+            n_ctx=settings.LLAMA_N_CTX,
+            n_threads=settings.LLAMA_N_THREADS,
+            verbose=settings.LLAMA_VERBOSE,
+        )
+        logger.info("Coder model loaded successfully")
+    return _coder_model
 
-    max_attempts = 2  # 1 retry for transient HTTP errors
-    for attempt in range(max_attempts):
-        try:
-            response = requests.post(url, json=payload, timeout=timeout)
 
-            # Retry on transient HTTP errors (502, 503)
-            if response.status_code in (502, 503) and attempt < max_attempts - 1:
-                logger.warning(f"Transient HTTP {response.status_code}, retrying in 2s...")
-                time.sleep(2)
-                continue
+def _get_model(model_name: str) -> Llama:
+    """Route model name string to the correct loaded model."""
+    if "coder" in model_name.lower():
+        return _get_coder_model()
+    return _get_instruct_model()
 
-            response.raise_for_status()
-            return response
 
-        except requests.ConnectionError:
-            raise OllamaConnectionError(
-                f"Cannot connect to Ollama at {settings.OLLAMA_BASE_URL}. Is it running? "
-                f"Start with 'ollama serve' or launch the Ollama desktop app."
-            )
-        except requests.Timeout:
-            raise OllamaTimeoutError(
-                f"Ollama request timed out after {timeout}s. "
-                f"The model may be loading or the request may be too large."
-            )
+# ---------------------------------------------------------------------------
+# Outlines wrapper singletons + generator cache
+# ---------------------------------------------------------------------------
 
-    # Should not reach here, but just in case
-    response.raise_for_status()
-    return response
+_instruct_outlines_model: OutlinesLlamaCpp | None = None
+_coder_outlines_model: OutlinesLlamaCpp | None = None
 
+# Generator cache: schema class → Generator instance
+# Keyed separately per model so instruct and coder don't share generators
+_instruct_generators: dict[type, OutlinesGenerator] = {}
+_coder_generators: dict[type, OutlinesGenerator] = {}
+
+
+def _get_instruct_outlines_model() -> OutlinesLlamaCpp:
+    global _instruct_outlines_model
+    if _instruct_outlines_model is None:
+        _instruct_outlines_model = OutlinesLlamaCpp(_get_instruct_model())
+    return _instruct_outlines_model
+
+
+def _get_coder_outlines_model() -> OutlinesLlamaCpp:
+    global _coder_outlines_model
+    if _coder_outlines_model is None:
+        _coder_outlines_model = OutlinesLlamaCpp(_get_coder_model())
+    return _coder_outlines_model
+
+
+def _get_generator(model_name: str, schema: type) -> OutlinesGenerator:
+    """Return cached Generator for this model+schema pair, building if needed."""
+    if "coder" in model_name.lower():
+        cache = _coder_generators
+        outlines_model = _get_coder_outlines_model()
+    else:
+        cache = _instruct_generators
+        outlines_model = _get_instruct_outlines_model()
+
+    if schema not in cache:
+        logger.info(f"Building generator FSM for schema: {schema.__name__}")
+        cache[schema] = OutlinesGenerator(outlines_model, schema)
+
+    return cache[schema]
+
+
+# ---------------------------------------------------------------------------
+# Prompt formatting
+# ---------------------------------------------------------------------------
+
+def _format_prompt(system: str, user_prompt: str) -> str:
+    """Format using Qwen2.5 chat template (im_start/im_end tokens)."""
+    parts = []
+    if system:
+        parts.append(f"<|im_start|>system\n{system}<|im_end|>")
+    parts.append(f"<|im_start|>user\n{user_prompt}<|im_end|>")
+    parts.append("<|im_start|>assistant\n")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Public utility functions (signatures unchanged from Ollama version)
+# ---------------------------------------------------------------------------
 
 def estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~1 token per 3.5 characters for English text."""
+    """Rough token estimate: ~1 token per 3 chars for English text."""
     return len(text) // 3
 
 
 def truncate_to_token_budget(text: str, max_tokens: int) -> str:
     """Truncate text to fit within a token budget."""
-    max_chars = max_tokens * 3  # conservative estimate
+    max_chars = max_tokens * 3
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n... [truncated]"
 
 
-def call_ollama(
-    model: str,
-    prompt: str,
-    system: str = "",
-    temperature: float = 0.7,
-    format: str = "json"
-) -> dict:
+def _estimate_tokens(text: str) -> int:
+    """Internal alias for token estimation."""
+    return estimate_tokens(text)
+
+
+# ---------------------------------------------------------------------------
+# Availability check (compatibility shim)
+# ---------------------------------------------------------------------------
+
+def check_ollama_available() -> bool:
     """
-    Basic wrapper around Ollama API.
-    Returns the raw response from Ollama INCLUDING token counts.
+    Check if models are loadable. Kept for interface compatibility.
+    Now checks llama-cpp-python model load instead of Ollama HTTP ping.
     """
-    url = f"{settings.OLLAMA_BASE_URL}/api/generate"
+    try:
+        _get_instruct_model()
+        return True
+    except Exception as e:
+        logger.error(f"Model load check failed: {e}")
+        return False
 
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "system": system,
-        "temperature": temperature,
-        "format": format,
-        "stream": False
-    }
 
-    response = _post_with_retry(url, payload)
-    result = response.json()
-
-    # Extract token usage
-    prompt_tokens = result.get("prompt_eval_count", 0)
-    response_tokens = result.get("eval_count", 0)
-    total_tokens = prompt_tokens + response_tokens
-
-    logger.debug(f"LLM CALL | Model: {model} | Temp: {temperature} | Prompt: {len(prompt)} chars")
-    logger.debug(f"Tokens - Prompt: {prompt_tokens}, Response: {response_tokens}, Total: {total_tokens}")
-    logger.debug(f"Response: {result['response'][:200]}...")
-
-    return result
-
-def call_ollama_code(
-    model: str,
-    prompt: str,
-    system: str,
-    temperature: float = 0.1
-) -> tuple[str, int]:
-    """
-    Calls Ollama for code generation.
-    Returns (code_string, tokens_used).
-
-    Unlike call_ollama_structured, this expects plain text responses,
-    not JSON. Better for code generation.
-    """
-    url = f"{settings.OLLAMA_BASE_URL}/api/generate"
-
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "system": system,
-        "temperature": temperature,
-        "stream": False
-    }
-
-    response = _post_with_retry(url, payload)
-    result = response.json()
-
-    # Extract token usage
-    prompt_tokens = result.get("prompt_eval_count", 0)
-    response_tokens = result.get("eval_count", 0)
-    total_tokens = prompt_tokens + response_tokens
-
-    code = result["response"]
-
-    logger.debug(f"LLM CODE GEN | Model: {model} | Temp: {temperature}")
-    logger.debug(f"Tokens - Prompt: {prompt_tokens}, Response: {response_tokens}, Total: {total_tokens}")
-    logger.debug(f"Code length: {len(code)} chars | First 200: {code[:200]}...")
-
-    return code, total_tokens
+# ---------------------------------------------------------------------------
+# Structured generation (constrained decoding via Outlines)
+# ---------------------------------------------------------------------------
 
 def call_ollama_structured(
     model: str,
@@ -160,56 +176,116 @@ def call_ollama_structured(
     system: str,
     response_schema: Type[BaseModel],
     temperature: float = 0.7,
-    max_retries: int = 1
+    max_retries: int = 1,  # noqa: kept for signature compatibility, no longer used.
+                           # Outlines makes retries unnecessary -- invalid output
+                           # is impossible at the token sampling level.
 ) -> tuple[BaseModel, int]:
     """
-    Calls Ollama and validates response against Pydantic schema.
-    Returns (validated_object, total_tokens_used).
+    Generate structured output constrained to response_schema.
+
+    Uses Outlines to enforce schema at token sampling level.
+    Output is guaranteed valid JSON -- no JSON parsing failures, no retry needed.
+
+    KNOWN LIMITATION: Token counts are estimated (~1 per 3 chars), not exact.
+    Affects plan.token_usage accuracy. Acceptable until Outlines exposes raw counts.
+
+    Returns (validated_pydantic_object, estimated_tokens_used).
     """
+    formatted_prompt = _format_prompt(system, prompt)
+    generator = _get_generator(model, response_schema)
 
-    total_tokens = 0
-
-    for attempt in range(max_retries + 1):
-        logger.debug(f"Structured call attempt {attempt + 1}/{max_retries + 1}")
-
-        # Call Ollama
-        result = call_ollama(
-            model=model,
-            prompt=prompt,
-            system=system,
+    try:
+        raw: str = generator(
+            formatted_prompt,
             temperature=temperature,
-            format="json"
+            max_tokens=1024,
+            stop=["<|im_end|>", "<|endoftext|>"],
         )
+        logger.debug(f"Raw constrained output: {raw}")
 
-        # Accumulate token usage (in case of retries)
-        attempt_tokens = result.get("prompt_eval_count", 0) + result.get("eval_count", 0)
-        total_tokens += attempt_tokens
+        result = response_schema.model_validate(json.loads(raw))
 
-        # Parse the JSON response
-        try:
-            response_text = result["response"]
-            response_json = json.loads(response_text)
+        tokens_used = _estimate_tokens(formatted_prompt + raw)
+        logger.debug(
+            f"Structured call | Schema: {response_schema.__name__} "
+            f"| Model: {model} | ~{tokens_used} tokens"
+        )
+        return result, tokens_used
 
-            logger.debug(f"Parsed JSON successfully")
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse failed for {response_schema.__name__}. Raw: {raw!r}")
+        raise ValueError(f"Constrained decoding produced invalid JSON: {e}")
+    except Exception as e:
+        logger.error(f"Constrained generation failed for {response_schema.__name__}: {e}")
+        raise ValueError(f"Failed to generate valid {response_schema.__name__}: {e}")
 
-            # Validate against Pydantic schema
-            validated_object = response_schema(**response_json)
 
-            logger.debug(f"Validated as {response_schema.__name__} | Total tokens: {total_tokens}")
-            return validated_object, total_tokens
+# ---------------------------------------------------------------------------
+# Code generation (plain text, unconstrained)
+# ---------------------------------------------------------------------------
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"JSON parsing failed: {e}")
-            logger.debug(f"Raw response: {response_text[:500]}")
-            if attempt == max_retries:
-                raise ValueError(f"Ollama did not return valid JSON after {max_retries + 1} attempts: {e}")
+def call_ollama_code(
+    model: str,
+    prompt: str,
+    system: str,
+    temperature: float = 0.1,
+) -> tuple[str, int]:
+    """
+    Generate code as plain text (unconstrained).
+    Returns (code_string, tokens_used).
+    """
+    llm = _get_model(model)
+    formatted_prompt = _format_prompt(system, prompt)
 
-        except ValidationError as e:
-            logger.warning(f"Schema validation failed: {e}")
-            logger.debug(f"Received data: {response_json}")
-            if attempt == max_retries:
-                raise ValueError(f"Response doesn't match {response_schema.__name__} schema after {max_retries + 1} attempts")
+    response = llm(
+        formatted_prompt,
+        temperature=temperature,
+        max_tokens=2048,
+        stop=["<|im_end|>", "<|endoftext|>"],
+    )
 
-        # If we're retrying, add a note to the prompt
-        if attempt < max_retries:
-            prompt = f"{prompt}\n\nPREVIOUS ATTEMPT FAILED. Please ensure you return ONLY valid JSON matching the exact structure specified."
+    code = response["choices"][0]["text"].strip()
+    tokens_used = response["usage"]["total_tokens"]
+
+    logger.debug(
+        f"Code gen | Model: {model} | Temp: {temperature} "
+        f"| Tokens: {tokens_used} | Length: {len(code)} chars"
+    )
+    logger.debug(f"Code preview: {code[:200]}...")
+    return code, tokens_used
+
+
+# ---------------------------------------------------------------------------
+# Generic generation (compatibility shim for any direct callers)
+# ---------------------------------------------------------------------------
+
+def call_ollama(
+    model: str,
+    prompt: str,
+    system: str = "",
+    temperature: float = 0.7,
+    format: str = "json",  # noqa: kept for signature compatibility
+) -> dict:
+    """
+    Compatibility shim. Prefer call_ollama_structured for typed output.
+    Returns dict mimicking old Ollama response structure.
+    """
+    _ = format  # compatibility shim only
+    llm = _get_model(model)
+    formatted_prompt = _format_prompt(system, prompt)
+
+    response = llm(
+        formatted_prompt,
+        temperature=temperature,
+        max_tokens=1024,
+        stop=["<|im_end|>", "<|endoftext|>"],
+    )
+
+    text = response["choices"][0]["text"].strip()
+
+    # Mimic Ollama response structure for compatibility
+    return {
+        "response": text,
+        "prompt_eval_count": response["usage"].get("prompt_tokens", 0),
+        "eval_count": response["usage"].get("completion_tokens", 0),
+    }

@@ -3,7 +3,10 @@
     "allow": [
       "Bash(python:*)",
       "Bash(PYTHONIOENCODING=utf-8 python:*)",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "Bash(pip show outlines)",
+      "Bash(pip index versions llama-cpp-python)",
+      "Bash(nvcc --version)"
     ]
   }
 }

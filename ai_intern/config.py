@@ -37,6 +37,14 @@ class Settings(BaseSettings):
     # Logging
     LOG_LEVEL: str = "INFO"
 
+    # llama-cpp-python settings (replacing Ollama)
+    LLAMA_MODEL_PATH: str = r"E:\models\Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+    LLAMA_CODER_MODEL_PATH: str = r"E:\models\Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
+    LLAMA_N_GPU_LAYERS: int = 99    # Offload all layers to GPU
+    LLAMA_N_CTX: int = 4096         # Context window
+    LLAMA_N_THREADS: int = 8        # CPU threads for non-GPU ops
+    LLAMA_VERBOSE: bool = False     # Suppress llama.cpp startup noise
+
     model_config = {
         "env_prefix": "AI_INTERN_",
         "env_file": ".env",
