@@ -1,35 +1,38 @@
 """
-Planning diagnostic tool - runs only the planning stage and prints rich detail.
+Planning diagnostic tool -- walks through every stage of the planning pipeline.
 
 Usage:
-    python test_planning.py
-    python test_planning.py "your custom task here"
+    python test_planning.py                        # Run 5 default cases
+    python test_planning.py "your goal here"       # Run a single custom goal
+    python test_planning.py --quick "goal"         # Skip Step 3 (saves tokens)
+    python test_planning.py --quick                # Run all 5 cases without Step 3
 
-Tests the full planning pipeline in isolation:
-  - TaskClassifier (2x2 complexity/ambiguity verdict)
-  - Intermediate walk-through (clarify / decompose steps individually)
-  - HierarchicalPlanner (full recursive decomposition)
-  - Flat PlanningAgent (fallback mode, for comparison)
+Stages shown per case:
+  Step 1: TaskClassifier    -- 3-axis verdict: complexity x ambiguity x app-scale
+  Step 2: Planning walk-through -- each inner step one at a time (clarify / spec-gen / decompose)
+  Step 3: Full hierarchical plan -- complete task list with agent + contract details
 """
 
 import sys
 import io
 import time
+import textwrap
 import traceback
 
 # Force UTF-8 output on Windows
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-from ai_intern.schemas import RequestSchema, TaskSchema
+from ai_intern.schemas import RequestSchema, TaskSchema, PlanSchema
 from ai_intern.planning.classifier import TaskClassifier, TaskVerdict
 from ai_intern.planning.hierarchical import HierarchicalPlanner
-from ai_intern.planning.planner import PlanningAgent
+from ai_intern.planning.spec_generator import SpecGenerator
+from ai_intern.planning.environment import EnvironmentScanner
 from ai_intern.config import settings
 
-# ─────────────────────────────────────────────
-# ANSI color helpers
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
+# ANSI color helpers (ASCII-safe box drawing only)
+# ─────────────────────────────────────────────────────────
 RESET   = "\033[0m"
 BOLD    = "\033[1m"
 DIM     = "\033[2m"
@@ -40,365 +43,597 @@ CYAN    = "\033[96m"
 BLUE    = "\033[94m"
 MAGENTA = "\033[95m"
 
-def color(text, *codes):
+
+def c(text, *codes):
     return "".join(codes) + str(text) + RESET
 
+
 def header(text):
-    bar = "═" * (len(text) + 4)
-    print(f"\n{color(f'╔{bar}╗', BOLD, CYAN)}")
-    print(f"{color(f'║  {text}  ║', BOLD, CYAN)}")
-    print(f"{color(f'╚{bar}╝', BOLD, CYAN)}")
+    bar = "+" + "=" * (len(text) + 4) + "+"
+    print(f"\n{c(bar, BOLD, CYAN)}")
+    print(f"{c('|  ' + text + '  |', BOLD, CYAN)}")
+    print(f"{c(bar, BOLD, CYAN)}")
 
-def section(text):
-    print(f"\n{color('┌─ ' + text, BOLD, BLUE)}")
 
-def subsection(text):
-    print(f"  {color('│  ' + text, BOLD, YELLOW)}")
+def step_header(num: int, text: str):
+    label = f"Step {num}: {text}"
+    print(f"\n{c(label, BOLD, BLUE)}")
+    print(f"  {c('-' * len(label), DIM, BLUE)}")
 
-def field(label, value, indent=4):
-    pad = " " * indent
-    print(f"{pad}{color(label + ':', BOLD)} {value}")
 
-def dimfield(label, value, indent=4):
-    pad = " " * indent
-    print(f"{pad}{color(label + ':', BOLD)} {color(value, DIM)}")
+def sub(text: str):
+    print(f"\n    {c('[ ' + text + ' ]', BOLD, YELLOW)}")
 
-def error_box(label: str, err: Exception):
-    print(f"\n  {color('ERROR in ' + label + ':', BOLD, RED)}")
-    print(f"  {color(type(err).__name__ + ': ' + str(err), RED)}")
-    for line in traceback.format_exc().strip().splitlines()[-6:]:
-        print(f"    {color(line, DIM)}")
 
-def verdict_color(verdict: TaskVerdict) -> str:
-    colors = {
+def field(label: str, value, indent: int = 6):
+    print(f"{' ' * indent}{c(label + ':', BOLD)} {value}")
+
+
+def dimfield(label: str, value, indent: int = 6):
+    print(f"{' ' * indent}{c(label + ':', BOLD)} {c(str(value), DIM)}")
+
+
+def wrapped_field(label: str, value: str, indent: int = 6):
+    """Print a field whose value may be long -- wrap at ~100 chars."""
+    prefix_plain = " " * indent + label + ": "
+    prefix_colored = " " * indent + c(label + ":", BOLD) + " "
+    avail = 100 - len(prefix_plain)
+    lines = textwrap.wrap(str(value), max(avail, 30))
+    print(prefix_colored + c(lines[0] if lines else "", DIM))
+    for line in lines[1:]:
+        print(" " * (len(prefix_plain)) + c(line, DIM))
+
+
+def bullet(text: str, indent: int = 8):
+    print(f"{' ' * indent}{c('-', CYAN)} {c(text, DIM)}")
+
+
+def err_box(label: str, exc: Exception):
+    print(f"\n  {c('ERROR [' + label + ']:', BOLD, RED)}")
+    print(f"  {c(str(exc), RED)}")
+    for line in traceback.format_exc().strip().splitlines()[-5:]:
+        print(f"    {c(line, DIM)}")
+
+
+def verdict_badge(v: TaskVerdict) -> str:
+    vc = {
         TaskVerdict.EXECUTE:                GREEN,
         TaskVerdict.DECOMPOSE:              YELLOW,
         TaskVerdict.CLARIFY:               MAGENTA,
         TaskVerdict.CLARIFY_THEN_DECOMPOSE: RED,
     }
-    return color(f"[{verdict.value.upper()}]", BOLD, colors.get(verdict, RESET))
+    return c(f"[{v.value.upper()}]", BOLD, vc.get(v, RESET))
 
-def arrow(label):
-    print(f"    {color('→ ' + label, CYAN)}")
 
-# ─────────────────────────────────────────────
-# Step 1: Isolated classifier
-# ─────────────────────────────────────────────
-def run_classifier(goal: str):
-    """Returns (verdict, reasoning, tokens) or None on failure."""
-    section("Step 1 — TaskClassifier")
+def agent_badge(agent: str | None) -> str:
+    ac = {"code": CYAN, "research": BLUE, "file": YELLOW, "analysis": MAGENTA}
+    a = (agent or "?").lower()
+    return c(f"[{a}]", BOLD, ac.get(a, DIM))
+
+
+def yn(val: bool) -> str:
+    return c("Yes", BOLD, GREEN) if val else c("No", DIM)
+
+
+# ─────────────────────────────────────────────────────────
+# Step 1 -- Classification
+# ─────────────────────────────────────────────────────────
+
+def run_classify(
+    goal: str,
+    env_prompt: str = "",
+) -> "tuple | None":
+    """
+    Calls TaskClassifier once and shows all 3 axes of the result:
+      - is_complex, is_ambiguous  (map to verdict)
+      - is_app_scale  (from LLM + keyword safety-net)
+    Returns (verdict, reasoning, tokens, is_app_scale_final) or None.
+    """
+    step_header(1, "TaskClassifier  (complexity x ambiguity x app-scale)")
     task = TaskSchema(plan_id="test", task_order=0, goal=goal)
-
-    field("Goal", goal)
-    print(f"  {color('Calling Ollama...', DIM)}", end="", flush=True)
+    field("Goal", c(goal, DIM))
+    print(f"      {c('Calling Ollama...', DIM)}", end="", flush=True)
 
     try:
         t0 = time.perf_counter()
-        verdict, reasoning, tokens, is_app_scale = TaskClassifier.classify(task)
+        verdict, reasoning, tokens, is_app_scale_llm = TaskClassifier.classify(
+            task, {"environment": env_prompt}
+        )
         elapsed = time.perf_counter() - t0
+        print()
 
-        print(f"\r  {color('Result:', BOLD)}")
-        field("Verdict",   verdict_color(verdict))
-        field("Complex?",  color("Yes", YELLOW) if verdict in (TaskVerdict.DECOMPOSE, TaskVerdict.CLARIFY_THEN_DECOMPOSE) else color("No", GREEN))
-        field("Ambiguous?",color("Yes", MAGENTA) if verdict in (TaskVerdict.CLARIFY, TaskVerdict.CLARIFY_THEN_DECOMPOSE) else color("No", GREEN))
-        field("App-scale?",color("Yes", YELLOW) if is_app_scale else color("No", GREEN))
-        dimfield("Reasoning", reasoning)
-        field("Tokens", f"{tokens}  |  Time: {elapsed:.2f}s")
-        return verdict, reasoning, tokens, is_app_scale
+        # Keyword safety-net that also runs inside _decompose_recursive
+        is_app_scale_kw    = HierarchicalPlanner._keyword_is_app_scale(goal)
+        is_app_scale_final = is_app_scale_llm or is_app_scale_kw
+
+        is_complex   = verdict in (TaskVerdict.DECOMPOSE, TaskVerdict.CLARIFY_THEN_DECOMPOSE)
+        is_ambiguous = verdict in (TaskVerdict.CLARIFY,   TaskVerdict.CLARIFY_THEN_DECOMPOSE)
+
+        print()
+        field("Verdict",           verdict_badge(verdict))
+        field("  complex?",        yn(is_complex))
+        field("  ambiguous?",      yn(is_ambiguous))
+        print()
+        field("  is_app_scale (LLM)",     yn(is_app_scale_llm))
+
+        kw_note = ""
+        if is_app_scale_kw:
+            matched = [kw for kw in HierarchicalPlanner._APP_SCALE_KEYWORDS if kw in goal.lower()]
+            kw_note = c(f"  matched: {matched}", DIM)
+        field("  is_app_scale (keyword)", yn(is_app_scale_kw) + kw_note)
+
+        if is_app_scale_final and not is_app_scale_llm and is_complex:
+            field("  OVERRIDE applied",  c("EXECUTE -> DECOMPOSE  (keyword safety net)", YELLOW))
+        if is_app_scale_final and not is_app_scale_llm and not is_complex:
+            field("  OVERRIDE applied",  c("CLARIFY -> CTD  (keyword safety net)", YELLOW))
+        field("  final app-scale?",   yn(is_app_scale_final))
+
+        print()
+        wrapped_field("Reasoning", reasoning)
+        field("Tokens / Time", f"{tokens} tok  |  {elapsed:.2f}s")
+
+        return verdict, reasoning, tokens, is_app_scale_final
 
     except Exception as e:
         print()
-        error_box("TaskClassifier", e)
+        err_box("TaskClassifier", e)
         return None
 
-# ─────────────────────────────────────────────
-# Step 2: Intermediate walk-through
-# Manually calls _clarify_task / _decompose_task
-# to expose what the LLM produces at each inner step.
-# ─────────────────────────────────────────────
-def run_intermediate(goal: str, verdict: TaskVerdict):
+
+# ─────────────────────────────────────────────────────────
+# Step 2 -- Planning walk-through
+# ─────────────────────────────────────────────────────────
+
+def run_walkthrough(
+    goal: str,
+    verdict: TaskVerdict,
+    is_app_scale: bool,
+    env_prompt: str = "",
+) -> int:
     """
-    Manually invoke the internal planner methods based on the verdict.
-    Shows clarified goal, extracted_details, and raw subtask list.
+    Manually invokes each inner planning step based on verdict + is_app_scale.
+    Each LLM call is shown separately so the reasoning at each stage is visible.
+
+    Paths covered:
+      EXECUTE                    -> leaf-node analysis only (no LLM)
+      CLARIFY                    -> [A] clarify
+      DECOMPOSE (non-app-scale)  -> [B] decompose (LLM)  -> [C] subtask analysis
+      DECOMPOSE (app-scale)      -> [B] spec-gen (LLM)   -> [C] spec-to-tasks (no LLM)
+      CTD (non-app-scale)        -> [A] clarify (LLM)    -> [B] decompose (LLM)   -> [C] subtask analysis
+      CTD (app-scale)            -> [B] spec-gen (LLM)   -> [C] spec-to-tasks (no LLM)
+                                    (clarification skipped -- spec replaces it)
+
     Returns total tokens used.
     """
-    section("Step 2 — Intermediate Walk-through")
-    task = TaskSchema(plan_id="test", task_order=0, goal=goal)
-    context = {"parent_goal": None}
-    total_tokens = 0
+    step_header(2, "Planning walk-through  (inner steps, one at a time)")
+    task    = TaskSchema(plan_id="test", task_order=0, goal=goal)
+    ctx     = {"parent_goal": None, "environment": env_prompt}
+    total   = 0
 
-    # ── EXECUTE: nothing to walk through ──────
-    if verdict == TaskVerdict.EXECUTE:
-        print(f"  {color('Verdict is EXECUTE — no intermediate steps needed.', DIM)}")
-        print(f"  {color('Task is clear and simple enough to run directly.', DIM)}")
+    # ──────────────────────────────────────────────────────────────────
+    # EXECUTE path: nothing to plan -- just show the leaf-node analysis
+    # ──────────────────────────────────────────────────────────────────
+    if verdict == TaskVerdict.EXECUTE and not is_app_scale:
+        print(f"\n      {c('Verdict is EXECUTE -- task is simple and clear.', DIM)}")
+        print(f"      {c('No clarification or decomposition needed.', DIM)}")
+
+        sub("Leaf-node analysis  (no LLM)")
+        is_simple = HierarchicalPlanner._is_obviously_simple(goal)
+        inferred  = HierarchicalPlanner._infer_agent_from_goal(goal)
+        field("_is_obviously_simple", yn(is_simple),
+              indent=6)
+        field("Inferred agent",       agent_badge(inferred))
         return 0
 
-    # ── CLARIFY (with or without decompose) ───
-    if verdict in (TaskVerdict.CLARIFY, TaskVerdict.CLARIFY_THEN_DECOMPOSE):
-        subsection("Clarification step")
-        print(f"  {color('Calling Ollama...', DIM)}", end="", flush=True)
+    # ──────────────────────────────────────────────────────────────────
+    # A: Clarification
+    # Runs for: CLARIFY (single action, vague)
+    #           CTD + non-app-scale (complex, vague, needs clarify before decompose)
+    # Skipped for: CTD + app-scale (SpecGenerator replaces clarification)
+    # ──────────────────────────────────────────────────────────────────
+    clarified_task = task  # updated if clarification runs
+    do_clarify = (
+        verdict in (TaskVerdict.CLARIFY, TaskVerdict.CLARIFY_THEN_DECOMPOSE)
+        and not is_app_scale
+    )
+    if do_clarify:
+        sub("A: Clarification  (LLM call)")
+        field("Original goal", c(goal, DIM))
+        print(f"      {c('Calling Ollama (clarify)...', DIM)}", end="", flush=True)
         try:
             t0 = time.perf_counter()
-            clarified_task, tokens = HierarchicalPlanner._clarify_task(task, context)
+            clarified_task, cl_tokens = HierarchicalPlanner._clarify_task(task, ctx)
             elapsed = time.perf_counter() - t0
-            total_tokens += tokens
+            total += cl_tokens
+            print()
+            field("Clarified goal", c(clarified_task.goal, GREEN))
+            field("Tokens / Time",  f"{cl_tokens} tok  |  {elapsed:.2f}s")
+        except Exception as e:
+            print()
+            err_box("_clarify_task", e)
 
-            print(f"\r")
-            field("Original goal",   color(goal, DIM))
-            arrow("Clarified goal")
-            field("Clarified goal",  color(clarified_task.goal, GREEN))
+        # CLARIFY-only path ends here
+        if verdict == TaskVerdict.CLARIFY:
+            inferred = HierarchicalPlanner._infer_agent_from_goal(clarified_task.goal)
+            field("Inferred agent", agent_badge(inferred))
+            return total
 
-            # Re-run classifier on the clarified goal so we can see if it changed
-            print(f"\n    {color('Re-classifying clarified goal...', DIM)}", end="", flush=True)
-            clarified_schema = TaskSchema(plan_id="test", task_order=0, goal=clarified_task.goal)
-            new_verdict, new_reasoning, cls_tokens = TaskClassifier.classify(clarified_schema)
-            total_tokens += cls_tokens
-            print(f"\r    {color('Clarified verdict:', BOLD)} {verdict_color(new_verdict)}")
-            dimfield("Reasoning", new_reasoning, indent=4)
-            field("Tokens", f"{tokens} (clarify) + {cls_tokens} (re-classify)  |  Time: {elapsed:.2f}s")
+    # ──────────────────────────────────────────────────────────────────
+    # B: App-scale note  (for DECOMPOSE / CTD paths)
+    # ──────────────────────────────────────────────────────────────────
+    if is_app_scale:
+        sub("B: App-scale detected -- SpecGenerator path")
+        print(f"      {c('The planner skips standard LLM decomposition.', DIM)}")
+        print(f"      {c('SpecGenerator produces a structured AppSpec instead.', DIM)}")
+        if verdict == TaskVerdict.CLARIFY_THEN_DECOMPOSE:
+            print(f"      {c('(CTD + app-scale: clarification is also skipped -- spec replaces it)', DIM)}")
+    else:
+        sub("B: Standard decomposition -- LLM decompose path")
+        print(f"      {c('No app-spec needed. Decompose into 2-3 subtasks directly.', DIM)}")
 
-            # Use clarified task for decomposition step below
-            task = clarified_task
+    # ──────────────────────────────────────────────────────────────────
+    # C: SpecGenerator  (app-scale only)
+    # ──────────────────────────────────────────────────────────────────
+    spec = None
+    if is_app_scale:
+        sub("C: SpecGenerator  (LLM call)")
+        print(f"      {c('Calling Ollama (spec generator)...', DIM)}", end="", flush=True)
+        try:
+            t0 = time.perf_counter()
+            spec, spec_tokens = SpecGenerator.generate(task, ctx)
+            elapsed = time.perf_counter() - t0
+            total += spec_tokens
+            print()
+
+            field("Summary",    c(spec.summary, GREEN))
+
+            print()
+            field("Features",   f"({len(spec.features)} items)")
+            for feat in spec.features:
+                bullet(feat)
+
+            print()
+            field("Components", f"({len(spec.components)} -- each should be implementable in <=40 lines)")
+            for i, comp in enumerate(spec.components):
+                print()
+                print(f"        {c('[' + str(i) + '] ' + comp.name, BOLD, CYAN)}")
+                dimfield("          Responsibility", comp.responsibility)
+                dimfield("          Output file",   comp.output_file)
+                field(   "          Interface",     c(comp.public_interface, YELLOW))
+                deps = ", ".join(comp.depends_on) if comp.depends_on else c("(none)", DIM)
+                field("          Depends on",    deps)
+
+            print()
+            field("Done criteria", f"({len(spec.done_criteria)} items)")
+            for crit in spec.done_criteria:
+                bullet(crit)
+
+            print()
+            field("Tokens / Time", f"{spec_tokens} tok  |  {elapsed:.2f}s")
 
         except Exception as e:
             print()
-            error_box("_clarify_task", e)
-            # Fall through with original task
+            err_box("SpecGenerator", e)
+            spec = None
 
-    # ── DECOMPOSE (with or without prior clarify) ──
-    if verdict in (TaskVerdict.DECOMPOSE, TaskVerdict.CLARIFY_THEN_DECOMPOSE):
-        subsection("Decomposition step")
-        field("Task to decompose", color(task.goal, DIM))
-        print(f"  {color('Calling Ollama...', DIM)}", end="", flush=True)
-        try:
-            t0 = time.perf_counter()
-            subtasks, tokens = HierarchicalPlanner._decompose_task(task, context)
-            elapsed = time.perf_counter() - t0
-            total_tokens += tokens
-
-            print(f"\r  {color('Raw subtasks generated:', BOLD)} ({len(subtasks)} tasks in {elapsed:.2f}s, {tokens} tok)")
-            for i, st in enumerate(subtasks):
-                badge = color(f"[{i}]", BOLD, CYAN)
-                print(f"    {badge} {st.goal}")
-
-            # For each subtask, run the classifier to show what it would do next
-            print(f"\n    {color('Subtask classification preview:', BOLD)}")
-            for i, st in enumerate(subtasks):
-                if HierarchicalPlanner._is_obviously_simple(st.goal):
-                    badge = color(f"[{i}]", BOLD, CYAN)
-                    print(f"    {badge} {color('[obviously simple — skips classifier]', DIM)} {st.goal[:60]}")
+    # ──────────────────────────────────────────────────────────────────
+    # D: Task creation from spec  (app-scale, no LLM)
+    # ──────────────────────────────────────────────────────────────────
+    if is_app_scale and spec is not None:
+        sub("D: Spec-to-tasks  (deterministic, no LLM)")
+        print(f"      {c('One task per component. No Ollama call. Token cost: 0.', DIM)}")
+        subtasks, _ = HierarchicalPlanner._decompose_task_from_spec(task, spec)
+        for i, st in enumerate(subtasks):
+            print()
+            print(f"        {c('[Task ' + str(i) + ']', BOLD, CYAN)} {agent_badge(st.suggested_agent)}")
+            goal_lines = st.goal.split("\n")
+            for j, line in enumerate(goal_lines):
+                if j == 0:
+                    field("          Goal", c(line, DIM))
                 else:
-                    print(f"    {color('Calling Ollama...', DIM)}", end="", flush=True)
-                    st_schema = TaskSchema(plan_id="test", task_order=i, goal=st.goal)
-                    sub_verdict, sub_reasoning, sub_tokens = TaskClassifier.classify(st_schema, {"parent_goal": task.goal})
-                    total_tokens += sub_tokens
-                    badge = color(f"[{i}]", BOLD, CYAN)
-                    print(f"\r    {badge} {verdict_color(sub_verdict)} {st.goal[:60]}")
-                    dimfield("Reasoning", sub_reasoning[:100], indent=8)
+                    print(f"          {' ' * 6}{c(line, DIM)}")
+            if st.output_contract:
+                oc = st.output_contract
+                print(f"          {c('output_contract:', BOLD)}")
+                dimfield("            component",  oc.get("component_name", ""))
+                dimfield("            output_file", oc.get("output_file", ""))
+                dimfield("            interface",   oc.get("public_interface", ""))
 
-        except Exception as e:
+        return total
+
+    # ──────────────────────────────────────────────────────────────────
+    # D: Standard decomposition  (non-app-scale, LLM call)
+    # ──────────────────────────────────────────────────────────────────
+    sub("D: Standard decomposition  (LLM call)")
+    decompose_target = clarified_task
+    field("Task being decomposed", c(decompose_target.goal[:80], DIM))
+    print(f"      {c('Calling Ollama (decompose)...', DIM)}", end="", flush=True)
+    subtasks = []
+    try:
+        t0 = time.perf_counter()
+        subtasks, decomp_tokens = HierarchicalPlanner._decompose_task(decompose_target, ctx)
+        elapsed = time.perf_counter() - t0
+        total += decomp_tokens
+        print()
+        field("Subtasks returned", f"{len(subtasks)} in {elapsed:.2f}s  |  {decomp_tokens} tok")
+        print(f"      {c('(The LLM may return up to 3; hallucination filter may remove some)', DIM)}")
+        for i, st in enumerate(subtasks):
             print()
-            error_box("_decompose_task", e)
+            print(f"        {c('[' + str(i) + ']', BOLD, CYAN)} {agent_badge(st.suggested_agent)}")
+            field("          Goal",  c(st.goal, DIM))
 
-    return total_tokens
+    except Exception as e:
+        print()
+        err_box("_decompose_task", e)
 
-# ─────────────────────────────────────────────
-# Step 3: Full hierarchical plan
-# ─────────────────────────────────────────────
-def run_hierarchical(request: RequestSchema):
-    """Returns plan or None on failure."""
-    section("Step 3 — HierarchicalPlanner (full recursive result)")
-    field("Input", request.content)
+    # ──────────────────────────────────────────────────────────────────
+    # E: Subtask analysis  (non-app-scale, static checks -- no LLM)
+    # ──────────────────────────────────────────────────────────────────
+    if subtasks:
+        sub("E: Subtask analysis  (static, no LLM)")
+        print(f"      {c('_is_obviously_simple() decides if a subtask skips the classifier.', DIM)}")
+        print(f"      {c('If True -> treated as leaf node immediately (no Ollama call).', DIM)}")
+        print(f"      {c('If False -> classifier would run again on this subtask.', DIM)}")
+        for i, st in enumerate(subtasks):
+            is_simple = HierarchicalPlanner._is_obviously_simple(st.goal)
+            inferred  = HierarchicalPlanner._infer_agent_from_goal(st.goal)
+            fate      = c("LEAF -- skip classifier", DIM) if is_simple else c("CLASSIFY -- LLM call", YELLOW)
+            print()
+            print(f"        {c('[' + str(i) + ']', BOLD, CYAN)}")
+            dimfield("          Goal",                  st.goal[:70])
+            field(   "          _is_obviously_simple", f"{yn(is_simple)}  ->  {fate}")
+            field(   "          Inferred agent",        agent_badge(inferred))
+
+    return total
+
+
+# ─────────────────────────────────────────────────────────
+# Step 3 -- Full hierarchical plan
+# ─────────────────────────────────────────────────────────
+
+def run_full_plan(request: RequestSchema) -> "PlanSchema | None":
+    """
+    Calls HierarchicalPlanner.create_plan() and prints the complete integrated result.
+    Shows: plan metadata, app_spec (if any), and each task with its full goal,
+    suggested_agent, and output_contract.
+    """
+    step_header(3, "Full hierarchical plan  (complete recursive result)")
+    field("Input",  c(request.content, DIM))
     dimfield("Config", f"MAX_DECOMPOSITION_DEPTH={settings.MAX_DECOMPOSITION_DEPTH}")
-    print(f"  {color('Calling Ollama...', DIM)}", end="", flush=True)
+    print(f"      {c('Calling Ollama (full plan)...', DIM)}", end="", flush=True)
 
     try:
         t0 = time.perf_counter()
         plan = HierarchicalPlanner.create_plan(request)
         elapsed = time.perf_counter() - t0
+        print()
 
-        print(f"\r  {color('Final plan:', BOLD)} {color(plan.plan_id, DIM)}")
-        field("Tasks",  str(len(plan.tasks)))
-        field("Tokens", str(plan.token_usage))
-        field("Time",   f"{elapsed:.2f}s")
-        print(f"\n  {color('Executable task list (DFS order):', BOLD)}")
+        field("Plan ID", c(plan.plan_id, DIM))
+        field("Tasks",   str(len(plan.tasks)))
+        field("Tokens",  str(plan.token_usage))
+        field("Time",    f"{elapsed:.2f}s")
+
+        # App spec summary
+        if plan.app_spec:
+            sub("App spec (attached to plan by SpecGenerator)")
+            sd = plan.app_spec
+            field("Summary",    c(sd.get("summary", ""), GREEN))
+            comps = sd.get("components", [])
+            field("Components", f"({len(comps)})")
+            for comp in comps:
+                print()
+                print(f"        {c(comp['name'], BOLD, CYAN)}")
+                dimfield("          output_file", comp.get("output_file", ""))
+                field(   "          interface",   c(comp.get("public_interface", ""), YELLOW))
+                deps = comp.get("depends_on", [])
+                field("          depends_on",  ", ".join(deps) if deps else c("(none)", DIM))
+
+        # Final task list -- this is what the Orchestrator will execute
+        sub("Executable task list  (DFS order -- what the Orchestrator runs)")
+        print(f"      {c('Each task is a single agent call. Spec-driven tasks have output_contract.', DIM)}")
+
         for task in plan.tasks:
-            badge = color(f"[{task.task_order}]", BOLD, CYAN)
-            print(f"    {badge} {task.goal}")
+            print()
+            badge = c(f"[{task.task_order}]", BOLD, CYAN)
+            print(f"      {badge}  {agent_badge(task.suggested_agent)}")
+
+            # Show full multi-line goal (spec-driven goals span 4-5 lines)
+            goal_lines = task.goal.split("\n")
+            for j, line in enumerate(goal_lines):
+                if j == 0:
+                    field("        Goal", c(line, DIM))
+                else:
+                    print(f"               {c(line, DIM)}")
+
+            # output_contract (only on spec-driven component tasks)
+            if task.output_contract:
+                oc = task.output_contract
+                field("        Contract",   c(oc.get("component_name", ""), BOLD, CYAN))
+                dimfield("          file",      oc.get("output_file", ""))
+                dimfield("          interface", oc.get("public_interface", ""))
+
         return plan
 
     except Exception as e:
         print()
-        error_box("HierarchicalPlanner", e)
+        err_box("HierarchicalPlanner.create_plan", e)
         return None
 
-# ─────────────────────────────────────────────
-# Step 4: Flat planning agent (for comparison)
-# ─────────────────────────────────────────────
-def run_flat_planner(request: RequestSchema):
-    """Returns plan or None on failure."""
-    section("Step 4 — Flat PlanningAgent (legacy, for comparison)")
-    field("Input", request.content)
-    print(f"  {color('Calling Ollama...', DIM)}", end="", flush=True)
 
-    try:
-        t0 = time.perf_counter()
-        plan = PlanningAgent.create_plan(request)
-        elapsed = time.perf_counter() - t0
+# ─────────────────────────────────────────────────────────
+# Test cases
+# ─────────────────────────────────────────────────────────
 
-        print(f"\r  {color('Plan:', BOLD)} {color(plan.plan_id, DIM)}")
-        field("Tasks",  str(len(plan.tasks)))
-        field("Tokens", str(plan.token_usage))
-        field("Time",   f"{elapsed:.2f}s")
-        print(f"\n  {color('Task list:', BOLD)}")
-        for task in plan.tasks:
-            badge = color(f"[{task.task_order}]", BOLD, CYAN)
-            print(f"    {badge} {task.goal}")
-        return plan
-
-    except Exception as e:
-        print()
-        error_box("PlanningAgent", e)
-        return None
-
-# ─────────────────────────────────────────────
-# Test suite
-# ─────────────────────────────────────────────
 DEFAULT_TEST_CASES = [
-    # (label, input, expected_verdict)
-    ("Simple + Clear",
-     "Write a fibonacci function",
-     TaskVerdict.EXECUTE),
+    # (label, goal, expected_verdict)
+    #
+    # Covers all 4 verdict paths + app-scale vs non-app-scale.
+    # Expected verdict is used for a PASS/FAIL check at Step 1.
+    # Set to None when verdict is legitimately non-deterministic.
 
-    ("Complex + Clear",
-     "Research chicken thigh macros and write a calculator function, save as calc.py",
-     TaskVerdict.DECOMPOSE),
-
-    ("Simple + Ambiguous",
-     "Make it better",
-     TaskVerdict.CLARIFY),
-
-    ("Complex + Ambiguous",
-     "Build a web scraper with storage and make it good",
-     TaskVerdict.CLARIFY_THEN_DECOMPOSE),
-
-    ("File read + analysis",
-     "Read Workouts.csv and calculate average calories, save summary",
-     TaskVerdict.DECOMPOSE),
+    (
+        "EXECUTE path  [simple + clear]",
+        "Write a fibonacci function",
+        TaskVerdict.EXECUTE,
+    ),
+    (
+        "DECOMPOSE path  [research + code + file, non-app-scale]",
+        "Research chicken thigh macros and write a macro calculator, save as macros.py",
+        TaskVerdict.DECOMPOSE,
+    ),
+    (
+        "CLARIFY path  [simple + ambiguous]",
+        "Make it better",
+        TaskVerdict.CLARIFY,
+    ),
+    (
+        "DECOMPOSE path  [app-scale: note-taking app]",
+        "Build a note-taking app with save, load, and list",
+        TaskVerdict.DECOMPOSE,
+    ),
+    (
+        "CTD path  [app-scale: vague app request]",
+        "Build an app for my business",
+        TaskVerdict.CLARIFY_THEN_DECOMPOSE,
+    ),
 ]
 
 
-def run_suite(task_inputs: list[str] | None = None):
-    if task_inputs:
-        cases = [(f"Custom: {t[:40]}", t, None) for t in task_inputs]
+# ─────────────────────────────────────────────────────────
+# Per-case runner
+# ─────────────────────────────────────────────────────────
+
+def run_case(
+    label: str,
+    goal: str,
+    expected: "TaskVerdict | None",
+    quick: bool = False,
+) -> "dict | None":
+    header(label)
+
+    # Scan environment once; share across all steps
+    env_ctx    = EnvironmentScanner.scan()
+    env_prompt = env_ctx.to_prompt_block()
+    if env_ctx.available_files:
+        files_str = ", ".join(f.filename for f in env_ctx.available_files[:5])
+        print(f"  {c('Files in user_data/:', BOLD)} {c(files_str, DIM)}")
+
+    total_tokens = 0
+
+    # Step 1 -- classify
+    cls_result = run_classify(goal, env_prompt)
+    if cls_result is None:
+        print(f"\n  {c('Classification failed -- skipping remaining steps.', RED)}")
+        return None
+
+    verdict, _reasoning, cls_tokens, is_app_scale = cls_result
+    total_tokens += cls_tokens
+
+    if expected is not None:
+        match = (verdict == expected)
+        status = c("PASS", BOLD, GREEN) if match else c("FAIL", BOLD, RED)
+        print(f"\n      Expected: {verdict_badge(expected)}  ->  {status}")
+
+    # Step 2 -- walk-through
+    walk_tokens = run_walkthrough(goal, verdict, is_app_scale, env_prompt)
+    total_tokens += walk_tokens
+
+    # Step 3 -- full plan (skipped in --quick mode)
+    plan = None
+    if not quick:
+        print(f"\n  {c('(Step 3 re-runs the planner end-to-end -- LLM calls may vary slightly.)', DIM)}")
+        plan = run_full_plan(RequestSchema(content=goal))
+        if plan:
+            total_tokens += plan.token_usage
+
+    print(f"\n  {c('Case total tokens:', BOLD)} {total_tokens}")
+
+    return {
+        "label":     label,
+        "verdict":   verdict.value,
+        "expected":  expected.value if expected else "--",
+        "match":     (verdict == expected) if expected else None,
+        "app_scale": is_app_scale,
+        "tasks":     len(plan.tasks) if plan else "--",
+        "tokens":    total_tokens,
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# Suite runner + summary
+# ─────────────────────────────────────────────────────────
+
+def run_suite(custom_goals: "list[str] | None", quick: bool):
+    if custom_goals:
+        cases = [(f"Custom: {g[:55]}", g, None) for g in custom_goals]
     else:
         cases = DEFAULT_TEST_CASES
 
-    total_tokens = 0
-    results = []
+    results   = []
+    total_tok = 0
 
-    for label, task_str, expected in cases:
-        header(label)
+    for label, goal, expected in cases:
+        result = run_case(label, goal, expected, quick=quick)
+        if result:
+            results.append(result)
+            total_tok += result["tokens"]
 
-        # ── Step 1: Classifier ───────────────────
-        cls_result = run_classifier(task_str)
-        verdict = None
-        cls_tokens = 0
-
-        if cls_result is not None:
-            verdict, _, cls_tokens, _is_app_scale = cls_result
-            total_tokens += cls_tokens
-
-            if expected is not None:
-                match = verdict == expected
-                status = color("PASS", BOLD, GREEN) if match else color("FAIL", BOLD, RED)
-                print(f"\n  Expected verdict {color(expected.value.upper(), DIM)} → {status}")
-
-        # ── Step 2: Intermediate walk-through ────
-        if verdict is not None:
-            inter_tokens = run_intermediate(task_str, verdict)
-            total_tokens += inter_tokens
-        else:
-            inter_tokens = 0
-
-        # ── Step 3: Full hierarchical plan ───────
-        request = RequestSchema(content=task_str)
-        hier_plan = run_hierarchical(request)
-        hier_tokens = hier_plan.token_usage if hier_plan else 0
-        total_tokens += hier_tokens
-
-        # ── Step 4: Flat planner (comparison) ────
-        flat_plan = run_flat_planner(request)
-        flat_tokens = flat_plan.token_usage if flat_plan else 0
-        total_tokens += flat_tokens
-
-        # ── Side-by-side comparison ───────────────
-        if hier_plan is not None and flat_plan is not None:
-            section("Comparison: Hierarchical vs Flat")
-            hier_goals = [t.goal for t in hier_plan.tasks]
-            flat_goals = [t.goal for t in flat_plan.tasks]
-            max_len = max(len(hier_goals), len(flat_goals))
-
-            print(f"  {'Hierarchical':<50}  {'Flat'}")
-            print(f"  {'─'*48}  {'─'*48}")
-            for i in range(max_len):
-                h  = f"[{i}] {hier_goals[i]}" if i < len(hier_goals) else color("(no task)", DIM)
-                f_ = f"[{i}] {flat_goals[i]}" if i < len(flat_goals) else color("(no task)", DIM)
-                print(f"  {h[:48]:<50}  {f_[:48]}")
-
-        # ── Record for summary ────────────────────
-        results.append({
-            "label":      label,
-            "verdict":    verdict.value if verdict else color("ERROR", RED),
-            "expected":   expected.value if expected else "—",
-            "match":      (verdict == expected) if (verdict and expected) else None,
-            "hier_tasks": len(hier_plan.tasks) if hier_plan else color("ERR", RED),
-            "flat_tasks": len(flat_plan.tasks) if flat_plan else color("ERR", RED),
-            "tokens":     cls_tokens + inter_tokens + hier_tokens + flat_tokens,
-            "hier_error": hier_plan is None,
-            "flat_error": flat_plan is None,
-            "cls_error":  cls_result is None,
-        })
-
-    # ── Summary table ────────────────────────────
+    # Summary table
     header("Summary")
-    print(f"  {'Label':<40} {'Verdict':<28} {'Expected':<28} {'Match':<6} {'H':>4} {'F':>4} {'Tok':>6}")
-    print(f"  {'─'*40} {'─'*27} {'─'*27} {'─'*6} {'─':>4} {'─':>4} {'─':>6}")
+    col_w = [45, 22, 22, 7, 11, 7, 7]
+    hdrs  = ["Label", "Verdict", "Expected", "Match", "App-scale", "Tasks", "Tokens"]
+    print("  " + "  ".join(f"{h:<{w}}" for h, w in zip(hdrs, col_w)))
+    print("  " + "  ".join("-" * w for w in col_w))
 
+    passes = fails = 0
     for r in results:
-        match_str = (
-            color("✓", GREEN) if r["match"] is True
-            else color("✗", RED) if r["match"] is False
-            else color("─", DIM)
+        if r["match"] is True:
+            match_str = c("PASS", GREEN)
+            passes += 1
+        elif r["match"] is False:
+            match_str = c("FAIL", RED)
+            fails += 1
+        else:
+            match_str = c("--", DIM)
+
+        print(
+            f"  {r['label']:<{col_w[0]}}"
+            f"  {r['verdict']:<{col_w[1]}}"
+            f"  {r['expected']:<{col_w[2]}}"
+            f"  {match_str:<{col_w[3]}}"
+            f"  {str(r['app_scale']):<{col_w[4]}}"
+            f"  {str(r['tasks']):<{col_w[5]}}"
+            f"  {r['tokens']:>{col_w[6]}}"
         )
-        print(f"  {r['label']:<40} {r['verdict']:<28} {r['expected']:<28} {match_str:<6} "
-              f"{str(r['hier_tasks']):>4} {str(r['flat_tasks']):>4} {r['tokens']:>6}")
 
-    errors = [r for r in results if r["cls_error"] or r["hier_error"] or r["flat_error"]]
-    if errors:
-        print(f"\n  {color('Errors encountered:', BOLD, RED)}")
-        for r in errors:
-            parts = []
-            if r["cls_error"]:  parts.append("Classifier")
-            if r["hier_error"]: parts.append("HierarchicalPlanner")
-            if r["flat_error"]: parts.append("PlanningAgent")
-            print(f"    {r['label']}: {', '.join(parts)} failed — see output above for details")
+    expected_count = passes + fails
+    print(f"\n  Verdict accuracy:   {passes}/{expected_count}")
+    print(f"  Grand total tokens: {total_tok}")
 
-    print(f"\n  {color('Total tokens used:', BOLD)} {total_tokens}")
-    print(f"  H = hierarchical task count  |  F = flat task count\n")
-
-
-# ─────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────
-if __name__ == "__main__":
-    custom_tasks = sys.argv[1:] if len(sys.argv) > 1 else None
-
-    if custom_tasks:
-        print(color(f"\nRunning {len(custom_tasks)} custom task(s)...", BOLD))
+    if quick:
+        print(f"  {c('(--quick mode: Step 3 was skipped for all cases)', DIM)}")
     else:
-        print(color("\nRunning default test suite (5 cases)...", BOLD))
-        print(color("  Pass a task as argument to test a custom input instead.", DIM))
-        print(color('  Example: python test_planning.py "Research X and write a script"', DIM))
+        print(f"  {c('Tokens: Step 1 (classify) + Step 2 (walk-through) + Step 3 (full plan)', DIM)}")
 
-    run_suite(custom_tasks)
+
+# ─────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    args   = sys.argv[1:]
+    quick  = "--quick" in args
+    goals  = [a for a in args if a != "--quick"]
+
+    if goals:
+        print(c(f"\nRunning {len(goals)} custom goal(s)...", BOLD))
+        if quick:
+            print(c("  (--quick: Step 3 skipped)", DIM))
+    else:
+        print(c("\nPlanning diagnostic  --  5 test cases", BOLD))
+        print(c("  Covers: EXECUTE / DECOMPOSE / CLARIFY / CTD paths + app-scale", DIM))
+        print(c("  Add --quick to skip Step 3 and save ~50% of tokens.", DIM))
+        print(c('  Example: python test_planning.py "Build a REST API"', DIM))
+        print(c('  Example: python test_planning.py --quick', DIM))
+
+    run_suite(goals if goals else None, quick=quick)

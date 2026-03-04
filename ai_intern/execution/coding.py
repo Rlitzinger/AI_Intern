@@ -25,6 +25,8 @@ CRITICAL RULES:
 - NO if __name__ == "__main__" blocks
 - NO explanatory text before or after the code
 - Code should be importable with no side effects
+- Only import packages listed in the AVAILABLE PYTHON PACKAGES block.
+- If a needed package is listed under NOT INSTALLED, use an alternative or stdlib.
 
 Your response should start directly with Python code (imports or function definitions)."""
 
@@ -33,6 +35,11 @@ Your response should start directly with Python code (imports or function defini
         """Build the code generation prompt from a task."""
 
         prompt_parts = []
+
+        # Inject available library awareness (lazy import to avoid circular dependency)
+        from ..validation.error_classifier import ErrorClassifier
+        lib_block = ErrorClassifier.get_available_libraries_block()
+        prompt_parts.append(f"{lib_block}\n\n")
 
         # Add context if available (#5 - prefer data_summary over raw result)
         if context and context.get('previous_tasks'):
@@ -48,6 +55,13 @@ Your response should start directly with Python code (imports or function defini
                 elif prev_task.get('result'):
                     result_preview = prev_task['result'][:500]
                     prompt_parts.append(f"Result:\n{result_preview}\n")
+
+                # Add structured key-value data if available
+                if prev_task.get('key_values'):
+                    kv = prev_task['key_values']
+                    kv_lines = [f"  {k}: {v}" for k, v in kv.items()]
+                    prompt_parts.append("Structured data from research:\n" + "\n".join(kv_lines) + "\n")
+                    prompt_parts.append("Use these exact values in your code.\n")
 
             prompt_parts.append("Use the above information when writing your code.\n\n")
 
@@ -66,14 +80,13 @@ Your response should start directly with Python code (imports or function defini
         if estimate_tokens(context_text) > budget:
             prompt_parts = [truncate_to_token_budget(context_text, budget)]
 
-        # Add error history for retries (#9)
+        # Add structured error history for retries (#9 + Tier 2 Phase 3)
         if context and context.get('error_history'):
             latest = context['error_history'][-1]
-            prompt_parts.append("PREVIOUS ATTEMPT FAILED:\n")
-            prompt_parts.append(f"Error: {latest['error']}\n")
-            if latest.get('test_code'):
-                prompt_parts.append(f"Failed test:\n{latest['test_code']}\n")
-            prompt_parts.append("Fix the issue in your code.\n\n")
+            attempt_num = latest.get('attempt', '?')
+            max_attempts = len(context['error_history']) + 1  # rough estimate
+            correction = CodingAgent._build_correction_prompt(latest)
+            prompt_parts.append(correction)
 
         # Add the main task
         prompt_parts.append(f"Task: {task.goal}\n")
@@ -131,6 +144,47 @@ Do NOT wrap in ```python``` or ``` blocks.""")
         logger.debug(f"Tokens consumed: {tokens}")
 
         return task, tokens
+
+    @staticmethod
+    def _build_correction_prompt(error_entry: dict) -> str:
+        """Build a category-aware correction prompt for retries."""
+        category = error_entry.get('category', 'retryable_logic')
+        error_msg = error_entry.get('error', 'Unknown error')
+        attempt = error_entry.get('attempt', 1)
+        test_code = error_entry.get('test_code', '')
+
+        lines = [f"=== RETRY (attempt {attempt + 1}) ==="]
+
+        if category == "retryable_syntax":
+            lines.append("Your previous code had a SYNTAX ERROR and could not be parsed.")
+            lines.append(f"Error: {error_msg}")
+            lines.append("")
+            lines.append("Fix: Ensure all brackets, quotes, and indentation are correct.")
+            lines.append("Write the COMPLETE corrected code.")
+
+        elif category == "retryable_runtime":
+            lines.append("Your previous code had a RUNTIME CRASH during testing.")
+            lines.append(f"Error: {error_msg}")
+            if test_code:
+                lines.append(f"\nFailing test:\n{test_code}")
+            lines.append("")
+            lines.append("Fix: Check all variables are defined before use and argument types are correct.")
+            lines.append("Do NOT change function signatures or class names.")
+            lines.append("Write the COMPLETE corrected code.")
+
+        else:
+            # retryable_logic (default) — test assertion failures
+            lines.append("Your previous code FAILED TESTS. It ran but produced wrong results.")
+            lines.append(f"Error: {error_msg}")
+            if test_code:
+                lines.append(f"\nFailing test:\n{test_code}")
+            lines.append("")
+            lines.append("Fix: Focus on the logic error indicated by the test.")
+            lines.append("Do NOT change function signatures or class names.")
+            lines.append("Write the COMPLETE corrected code.")
+
+        lines.append("")
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _strip_example_usage(code: str) -> str:

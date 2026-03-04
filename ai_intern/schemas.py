@@ -41,6 +41,7 @@ class TaskSchema(BaseModel):
     depends_on: list[int] = []  # Task order values this depends on (#19)
     output_contract: Optional[dict] = None  # {component_name, output_file, public_interface}
     suggested_agent: Optional[str] = None   # "code", "research", "file", "analysis" — set by planner
+    error_category: Optional[str] = None   # ErrorCategory value from error_classifier
 
 
 class PlanSchema(BaseModel):

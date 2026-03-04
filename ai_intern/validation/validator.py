@@ -1,6 +1,7 @@
 from ..schemas import TaskSchema
 from ..llm import call_ollama_code
 from ..orchestration.routing import TaskRouter
+from .test_sanitizer import TestSanitizer
 from ..config import settings
 from ..logging_config import get_logger
 import ast
@@ -232,12 +233,19 @@ Tests must verify:
 3. Basic return type is correct (not None unless documented)
 """
 
+        # Add public names from code analysis
+        defined_names = TestSanitizer.extract_public_names(task.result)
+        names_block = ""
+        if defined_names:
+            names_block = f"\nThe code defines: {', '.join(defined_names)}.\nOnly test these names.\n"
+
         prompt = f"""Given this Python code:
 
     {task.result}
 
     Task goal: {task.goal}
     {contract_block}
+    {names_block}
     {test_instructions}
 
     CRITICAL: Return ONLY executable Python test code using assert statements.
@@ -426,6 +434,11 @@ Tests must verify:
         logger.info("Generating tests...")
         test_code, test_tokens = cls.generate_tests(task)
         tokens_used += test_tokens
+
+        # Sanitize generated tests before execution
+        test_code, sanitizer_warnings = TestSanitizer.sanitize(task.result, test_code)
+        for w in sanitizer_warnings:
+            logger.warning(f"Test sanitizer: {w}")
 
         task.test_code = test_code
         logger.info(f"Tests generated ({test_tokens} tokens)")

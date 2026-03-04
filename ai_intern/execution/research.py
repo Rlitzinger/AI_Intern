@@ -1,9 +1,10 @@
-from ..schemas import TaskSchema
+from ..schemas import TaskSchema, TaskOutput
 from ..llm import call_ollama_code
 from ..config import settings
 from ..logging_config import get_logger
 from datetime import datetime, timezone
 from ddgs import DDGS
+import json
 
 logger = get_logger("research")
 
@@ -52,10 +53,24 @@ class ResearchAgent:
         synthesis, synth_tokens = cls._synthesize_findings(task.goal, search_results)
         tokens_used += synth_tokens
 
-        # Step 4: Store results
+        # Step 4: Extract structured key-value data from synthesis
+        key_values, kv_tokens = cls._extract_key_values(task.goal, synthesis)
+        tokens_used += kv_tokens
+
+        # Step 5: Store results
         task.result = synthesis
         task.status = "complete"
         task.completed_at = datetime.now(timezone.utc)
+
+        # Build structured TaskOutput
+        task.task_output = TaskOutput(
+            output_type="data",
+            raw_result=synthesis,
+            data_summary=synthesis[:500],
+        )
+        if key_values:
+            task.task_output.key_values = key_values
+            logger.info(f"Extracted {len(key_values)} key-value pairs from research")
 
         logger.info(f"Research complete ({tokens_used} tokens)")
         logger.debug(f"Summary length: {len(synthesis)} characters")
@@ -147,3 +162,57 @@ Do not add information not found in the sources."""
         )
 
         return synthesis.strip(), tokens
+
+    @classmethod
+    def _extract_key_values(cls, goal: str, synthesis: str) -> tuple:
+        """
+        Extract numeric key-value pairs from research synthesis.
+
+        Returns (dict, tokens_used). Empty dict on failure.
+        """
+        prompt = f"""Research goal: {goal}
+
+Research findings:
+{synthesis[:1500]}
+
+Extract ALL numeric facts and measurements from the research findings above.
+Return them as a flat JSON object with descriptive snake_case keys and numeric values.
+
+Example output:
+{{"protein_per_100g": 26, "fat_per_100g": 10, "calories_per_100g": 239}}
+
+If there are no numeric facts, return an empty JSON object: {{}}
+
+Return ONLY the JSON object, nothing else."""
+
+        system_prompt = (
+            "You are a data extraction assistant. "
+            "Extract numeric facts as JSON. Return ONLY valid JSON."
+        )
+
+        try:
+            response, tokens = call_ollama_code(
+                model=cls.model,
+                prompt=prompt,
+                system=system_prompt,
+                temperature=0.1,
+            )
+
+            # Try to parse JSON from response
+            response = response.strip()
+            # Strip markdown if present
+            if response.startswith("```json"):
+                response = response[len("```json"):].strip()
+            if response.startswith("```"):
+                response = response[3:].strip()
+            if response.endswith("```"):
+                response = response[:-3].strip()
+
+            data = json.loads(response)
+            if isinstance(data, dict):
+                return data, tokens
+            return {}, tokens
+
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"Key-value extraction failed: {e}")
+            return {}, 0

@@ -4,6 +4,7 @@ from .routing import TaskRouter
 from ..planning.planner import PlanningAgent
 from ..planning.hierarchical import HierarchicalPlanner
 from ..validation.validator import ValidationAgent
+from ..validation.error_classifier import ErrorClassifier, ErrorCategory
 from ..workspace import ProjectWorkspace
 from ..llm import call_ollama_code
 from ..preprocessing import preprocess_request
@@ -170,6 +171,11 @@ class Orchestrator:
                             if t.task_output and t.task_output.file_path
                             else None
                         ),
+                        'key_values': (
+                            t.task_output.key_values
+                            if t.task_output and t.task_output.key_values
+                            else None
+                        ),
                     }
                     for t in plan.tasks
                     if t.task_order < task.task_order and t.result is not None
@@ -265,12 +271,23 @@ class Orchestrator:
 
                 return True
 
+            # Classify the error before recording
+            category = ErrorClassifier.classify(task)
+            task.error_category = category.value
+
             # Failed - record to error history (#9)
             task.error_history.append({
                 'attempt': attempt + 1,
                 'error': task.error_message[:300] if task.error_message else 'Unknown error',
                 'test_code': task.test_code[:300] if task.test_code else None,
+                'category': category.value,
             })
+
+            # Early abort on unrecoverable errors
+            if category.value.startswith("unrecoverable"):
+                logger.error(f"Unrecoverable error ({category.value}), skipping retries")
+                task.retry_count = attempt + 1
+                return False
 
             task.retry_count = attempt + 1
 

@@ -184,6 +184,12 @@ class HierarchicalPlanner:
             logger.info(f"{indent}EXECUTE overridden to DECOMPOSE (is_app_scale=True)")
             verdict = TaskVerdict.DECOMPOSE
 
+        if verdict == TaskVerdict.CLARIFY and is_app_scale:
+            # CLARIFY means "single action but vague" — but if it's also app-scale, the
+            # "single action" assessment is wrong. Upgrade so SpecGenerator is reached.
+            logger.info(f"{indent}CLARIFY overridden to CLARIFY_THEN_DECOMPOSE (is_app_scale=True)")
+            verdict = TaskVerdict.CLARIFY_THEN_DECOMPOSE
+
         if verdict == TaskVerdict.EXECUTE:
             # Base case: task is executable — annotate agent if not already set
             logger.info(f"{indent}Executable task (leaf node)")
@@ -505,22 +511,25 @@ Example:
         """
         components = spec.components
 
-        # Cap at 3: group later components together if needed
-        if len(components) > 3:
+        # Cap at 5 — allows finer-grained specs to execute without grouping.
+        # Fewer large tasks is worse than more small tasks for the 7B model.
+        if len(components) > 5:
             logger.warning(
-                f"Spec has {len(components)} components — capping at 3 subtasks"
+                f"Spec has {len(components)} components — capping at 5 subtasks"
             )
-            components = components[:3]
+            components = components[:5]
 
         subtasks = []
         for comp in components:
+            # Concrete goal template: file, interface, and responsibility are explicit
             goal = (
-                f"Write `{comp.name}` class/module in `{comp.output_file}` "
-                f"with public interface: {comp.public_interface}. "
-                f"Responsibility: {comp.responsibility}."
+                f"Write `{comp.output_file}` Python module.\n"
+                f"Module name / class: {comp.name}\n"
+                f"Public interface (exact signatures): {comp.public_interface}\n"
+                f"Single responsibility: {comp.responsibility}"
             )
             if comp.depends_on:
-                goal += f" Depends on: {', '.join(comp.depends_on)}."
+                goal += f"\nImports from: {', '.join(comp.depends_on)} (already implemented)"
             subtask = TaskSchema(
                 plan_id=task.plan_id,
                 task_order=len(subtasks),

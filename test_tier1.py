@@ -357,6 +357,14 @@ def suite_3_agent_annotations() -> None:
             None,  # all should be "code"
             "spec-driven tasks all annotated code",
         ),
+        # CLARIFY + is_app_scale coverage: vague app request where LLM may return CLARIFY verdict.
+        # Previously this bug caused the planner to return 1 clarified task instead of a spec.
+        (
+            "build a web app that allows users to turn their written art ideas into a picture",
+            (2, 3),
+            None,  # spec-driven, all "code"
+            "CLARIFY+app_scale - vague app request must still produce multi-component plan",
+        ),
     ]
 
     for request, (min_tasks, max_tasks), expected_agents, note in cases:

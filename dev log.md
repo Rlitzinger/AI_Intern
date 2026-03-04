@@ -106,3 +106,11 @@
 - full 3 hierarchial planner
 - orchestrator can preprocess prompts, works with dependencies, synthesizes answers so i can understand them, puts error history in context, resets goals on retry
 - better guards against hallucinations
+
+# 3/2/2026
+- did a lot of work to upgrade to a tier 2 planning stage. 
+- basically better at reading specs and runing through them 
+- error classifier, early aborrt on unrecoverable errors (timeout, import issues)
+- available libary awareness
+- structure retry prmpting with category-aware correction prompts
+- kv cache values passed to coding agent
