@@ -4,6 +4,40 @@ from typing import Any, Literal, NamedTuple, Optional
 from uuid import uuid4
 
 
+class OutputContract(BaseModel):
+    """
+    Specifies what a task produces and who consumes it.
+    Generated during planning, used by CritiqueAgent to detect
+    context dependency failures before execution.
+    """
+    output_type: Literal["python_code", "prose", "structured_data", "file_path", "none"]
+    output_format: str  # e.g. "dict with keys: protein_g, fat_g as floats"
+    required_by_tasks: list[int] = []  # task_order values that consume this output
+
+
+class CritiqueIssue(BaseModel):
+    """A single issue found during plan critique."""
+    severity: Literal["blocking", "warning"]
+    issue_type: Literal[
+        "context_mismatch",   # Task expects format previous task won't produce
+        "missing_task",       # Implicit step not in plan
+        "wrong_agent",        # TaskRouter will misroute this task
+        "over_decomposed",    # Tasks that could/should be merged
+        "bad_contract",       # Output contract is vague or incorrect
+    ]
+    task_order: int           # Which task has the issue (-1 = plan-level)
+    description: str
+    suggested_fix: str
+
+
+class CritiqueResult(BaseModel):
+    """Full critique of a plan."""
+    approved: bool
+    issues: list[CritiqueIssue] = []
+    revised_goals: dict[int, str] = {}  # task_order -> new goal string
+    critique_reasoning: str
+
+
 class SubtaskSpec(BaseModel):
     """
     Structured subtask produced by the decomposer.
@@ -51,7 +85,7 @@ class TaskSchema(BaseModel):
     error_message: Optional[str] = None
     error_history: list[dict] = []  # [{attempt, error, test_code}] (#9)
     depends_on: list[int] = []  # Task order values this depends on (#19)
-    output_contract: Optional[dict] = None  # {component_name, output_file, public_interface}
+    output_contract: Optional[Any] = None  # dict (spec-driven: component_name, output_file, public_interface) or OutputContract (planning contracts)
     suggested_agent: Optional[str] = None   # "code", "research", "file", "analysis" — set by planner
     declared_agent: Optional[Literal["code", "research", "file"]] = None  # Set from SubtaskSpec
     error_category: Optional[str] = None   # ErrorCategory value from error_classifier

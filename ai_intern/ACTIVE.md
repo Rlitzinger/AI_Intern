@@ -1,258 +1,600 @@
-# ACTIVE TASK: SpecGenerator — Two Targeted Fixes
+# ACTIVE TASK: Add Critique Pass + Output Contracts to Planning Layer
 
-## What This Fixes
+## Overview
+Upgrade the planning system with two additions:
+1. **Output Contracts** — each task declares what it produces and who consumes it
+2. **CritiqueAgent** — reviews plans before execution, catches failures before they happen
 
-Two specific issues identified from live output analysis:
+This runs between planning and execution: `Plan → Critique → (revise if needed) → Execute`
 
-1. **PascalCase output filenames** — `ComponentSpec.output_file` returns `outputs/ImageCropper.py`
-   instead of `outputs/image_cropper.py`. The `_pascal_to_snake()` method exists but only runs
-   inside `_inject_capability_component()` (the safety net). The happy path has no enforcement.
-   This will cause import failures on Linux/Mac (case-sensitive filesystems).
-
-2. **Tautological `core_capability`** — `_extract_intent()` returned "implement image cropping
-   functionality" for a request about cropping images. This restates the action rather than naming
-   the mechanism. The `_design_components()` prompt then received this as ground truth and produced
-   a generic `execute(input: str) -> str` interface instead of `crop(image_path: str, box: tuple) -> str`.
-
-Both fixes are in one file: `ai_intern/planning/spec_generator.py`
+## Files to Modify
+- `schemas.py` — add 3 new models, update TaskSchema
+- `agents/planning/critic.py` — create new file
+- `agents/planning/hierarchical.py` — add contract generation
+- `agents/planning/__init__.py` — export CritiqueAgent
+- `agents/orchestration/orchestrator.py` — add Stage 1.5 critique pass
 
 ---
 
-## Fix 1: Enforce snake_case on `ComponentSpec.output_file`
+## Step 1: Update schemas.py
 
-### Problem
-
-`ComponentSpec.output_file` has no validator. The Phase 2 prompt says to use snake_case
-but the model ignores it. There is no enforcement layer.
-
-`_pascal_to_snake()` already exists as a static method on `SpecGenerator` — it is just
-never called on the happy path.
-
-### Solution
-
-Add a `field_validator` to `ComponentSpec` that normalises the path at Pydantic parse time.
-Extract the conversion logic into a module-level function `_to_snake_case()` so both
-`ComponentSpec` and `SpecGenerator._pascal_to_snake()` share one implementation.
-
-### Exact Changes
-
-**Step 1** — Add a module-level helper directly after the imports, before any class definitions:
+Add these three models to `schemas.py`:
 
 ```python
-def _to_snake_case(name: str) -> str:
-    """Convert PascalCase or mixed-case string to snake_case.
+from typing import Literal
 
-    Handles simple cases (ImageCropper -> image_cropper) and
-    consecutive-uppercase acronyms (HTTPServer -> http_server).
+class OutputContract(BaseModel):
     """
-    # Insert underscore before an uppercase letter that follows a lowercase letter or digit
-    s = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', name)
-    # Insert underscore before an uppercase letter that is followed by a lowercase letter
-    # when it is itself preceded by an uppercase letter  (handles "HTTPServer" -> "HTTP_Server")
-    s = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', '_', s)
-    return s.lower()
+    Specifies what a task produces and who consumes it.
+    Generated during planning, used by CritiqueAgent to detect
+    context dependency failures before execution.
+    """
+    output_type: Literal["python_code", "prose", "structured_data", "file_path", "none"]
+    output_format: str  # e.g. "dict with keys: protein_g, fat_g as floats"
+    required_by_tasks: list[int] = []  # task_order values that consume this output
+
+
+class CritiqueIssue(BaseModel):
+    """A single issue found during plan critique."""
+    severity: Literal["blocking", "warning"]
+    issue_type: Literal[
+        "context_mismatch",   # Task expects format previous task won't produce
+        "missing_task",       # Implicit step not in plan
+        "wrong_agent",        # TaskRouter will misroute this task
+        "over_decomposed",    # Tasks that could/should be merged
+        "bad_contract",       # Output contract is vague or incorrect
+    ]
+    task_order: int           # Which task has the issue (-1 = plan-level)
+    description: str
+    suggested_fix: str
+
+
+class CritiqueResult(BaseModel):
+    """Full critique of a plan."""
+    approved: bool
+    issues: list[CritiqueIssue] = []
+    revised_goals: dict[int, str] = {}  # task_order → new goal string
+    critique_reasoning: str
 ```
 
-Verify: `_to_snake_case("HTTPServer") == "http_server"` and
-`_to_snake_case("ImageCropper") == "image_cropper"` before committing.
+Also add this field to the existing `TaskSchema`:
+```python
+output_contract: Optional[OutputContract] = None
+```
 
-**Step 2** — Add a `field_validator` to `ComponentSpec`.
-Also add `field_validator` to the import from pydantic if not already present.
+---
+
+## Step 2: Create agents/planning/critic.py
+
+Create this file in full:
 
 ```python
-from pydantic import BaseModel, field_validator
+from schemas import PlanSchema, TaskSchema, CritiqueResult, CritiqueIssue, OutputContract
+from llm import call_ollama_structured
 
-class ComponentSpec(BaseModel):
-    name: str           # PascalCase — do NOT normalise this field
-    responsibility: str
-    output_file: str
-    depends_on: list[str] = []
-    public_interface: str
 
-    @field_validator("output_file", mode="before")
+class CritiqueAgent:
+    """
+    Critiques a generated plan before execution.
+
+    Checks for:
+    - Context dependency failures (task expects format previous task won't produce)
+    - Missing implicit steps
+    - TaskRouter misroutes (wrong agent will be assigned)
+    - Over-decomposition (redundant tasks)
+    - Vague output contracts
+
+    Only runs on plans with 3+ tasks (simpler plans skip critique).
+    Max 1 revision cycle to prevent infinite loops.
+    """
+
+    model = "qwen2.5:7b-instruct"
+    temperature = 0.2
+
+    system_prompt = """You are a plan critique expert for a multi-agent AI system.
+
+You review task plans before execution and identify failures that will occur.
+Be specific, technical, and actionable. Focus on real failure modes, not theoretical ones.
+
+The system has these agents:
+- CodingAgent: generates Python code. Keywords: write, function, script, implement, build, create
+- ResearchAgent: web search + synthesis. Keywords: research, find, investigate, search, explore
+- FileAgent: reads user_data/ and writes outputs/. Keywords: read file, save, write to outputs
+- ValidationAgent: runs after every task automatically (not in task list)
+
+TaskRouter uses keyword matching - it is not smart. If a task goal is ambiguous it will default to CodingAgent."""
+
+    # Mirrors routing.py keyword lists exactly
+    ROUTING_RULES = {
+        "file": ["read file", "load file", "read csv", "list files", "write output",
+                 "save to file", "save to outputs", "save the", "save results",
+                 "write to outputs", "write the results", "write to file", "output to file"],
+        "code": ["write", "code", "function", "script", "implement", "create", "build", "develop"],
+        "research": ["research", "find", "investigate", "search", "explore", "identify"],
+    }
+
     @classmethod
-    def normalise_output_file(cls, v: str) -> str:
+    def critique_plan(cls, plan: PlanSchema) -> tuple[CritiqueResult, int]:
         """
-        Enforce outputs/<snake_case_name>.py regardless of what the LLM returns.
+        Critique a plan and return issues + optional revisions.
 
-        Handles:
-          "outputs/ImageCropper.py"   -> "outputs/image_cropper.py"
-          "ImageCropper.py"           -> "outputs/image_cropper.py"
-          "outputs/image_cropper.py"  -> "outputs/image_cropper.py"  (no-op)
-          "outputs/HTTPServer.py"     -> "outputs/http_server.py"
+        Returns:
+            tuple: (CritiqueResult, tokens_used)
         """
-        if not isinstance(v, str):
-            return v
+        if len(plan.tasks) < 3:
+            print(f"   ⏭️  Skipping critique (only {len(plan.tasks)} task(s))")
+            return CritiqueResult(
+                approved=True,
+                issues=[],
+                revised_goals={},
+                critique_reasoning="Plan has fewer than 3 tasks - critique skipped."
+            ), 0
 
-        # Normalise path separators, extract filename only
-        filename = v.replace("\\", "/").split("/")[-1]
+        print(f"\n🔎 CritiqueAgent reviewing {len(plan.tasks)}-task plan...")
 
-        # Strip extension
-        stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+        # Run deterministic checks first (zero token cost)
+        deterministic_issues = cls._run_deterministic_checks(plan)
 
-        # Convert stem to snake_case and rebuild canonical path
-        return f"outputs/{_to_snake_case(stem)}.py"
+        # LLM critique pass
+        prompt = cls._build_prompt(plan, deterministic_issues)
+
+        result, tokens = call_ollama_structured(
+            model=cls.model,
+            prompt=prompt,
+            system=cls.system_prompt,
+            response_schema=CritiqueResult,
+            temperature=cls.temperature
+        )
+
+        # Merge deterministic issues with LLM issues
+        result.issues = deterministic_issues + result.issues
+
+        # Any blocking issue = not approved
+        blocking = [i for i in result.issues if i.severity == "blocking"]
+        if blocking:
+            result.approved = False
+            print(f"   ❌ Plan rejected: {len(blocking)} blocking issue(s)")
+        else:
+            result.approved = True
+            print(f"   ✅ Plan approved ({len(result.issues)} warning(s))")
+
+        for issue in result.issues:
+            emoji = "❌" if issue.severity == "blocking" else "⚠️"
+            print(f"   {emoji} Task {issue.task_order}: [{issue.issue_type}] {issue.description[:80]}")
+
+        return result, tokens
+
+    @classmethod
+    def _run_deterministic_checks(cls, plan: PlanSchema) -> list[CritiqueIssue]:
+        """
+        Checks that don't need an LLM.
+        Simulates routing and checks contract vs agent type.
+        Zero token cost.
+        """
+        issues = []
+
+        for task in plan.tasks:
+            goal_lower = task.goal.lower()
+            detected_type = cls._simulate_routing(goal_lower)
+
+            # Check contract vs what that agent actually produces
+            if task.output_contract:
+                contract_issue = cls._check_contract_vs_agent(task, detected_type)
+                if contract_issue:
+                    issues.append(contract_issue)
+
+            # Check context dependency format mismatches
+            if task.task_order > 0 and task.output_contract:
+                prev_tasks = [t for t in plan.tasks if t.task_order < task.task_order]
+                for prev in prev_tasks:
+                    if prev.output_contract and task.task_order in prev.output_contract.required_by_tasks:
+                        mismatch = cls._check_context_mismatch(prev, task)
+                        if mismatch:
+                            issues.append(mismatch)
+
+        return issues
+
+    @classmethod
+    def _simulate_routing(cls, goal_lower: str) -> str:
+        """Simulate TaskRouter.classify_task without importing it."""
+        for task_type, keywords in cls.ROUTING_RULES.items():
+            if any(kw in goal_lower for kw in keywords):
+                return task_type
+        return "unknown"
+
+    @classmethod
+    def _check_contract_vs_agent(cls, task: TaskSchema, agent_type: str) -> CritiqueIssue | None:
+        """Check if the output contract makes sense for the agent that will run this task."""
+        contract = task.output_contract
+
+        # ResearchAgent always produces prose
+        if agent_type == "research" and contract.output_type not in ["prose", "none"]:
+            return CritiqueIssue(
+                severity="blocking",
+                issue_type="bad_contract",
+                task_order=task.task_order,
+                description=f"Contract declares output_type='{contract.output_type}' but ResearchAgent always returns prose.",
+                suggested_fix="Set output_type='prose' or add a downstream task to parse research output into structured data."
+            )
+
+        # FileAgent read tasks produce formatted text, not structured_data
+        if agent_type == "file" and "read" in task.goal.lower() and contract.output_type == "structured_data":
+            return CritiqueIssue(
+                severity="warning",
+                issue_type="bad_contract",
+                task_order=task.task_order,
+                description="FileAgent read tasks return formatted text, not structured data.",
+                suggested_fix="Set output_type='prose' and add a processing task to extract values."
+            )
+
+        return None
+
+    @classmethod
+    def _check_context_mismatch(cls, producer: TaskSchema, consumer: TaskSchema) -> CritiqueIssue | None:
+        """Check if what producer outputs matches what consumer needs."""
+        if not producer.output_contract or not consumer.output_contract:
+            return None
+
+        # Consumer does computation but producer outputs prose
+        if (producer.output_contract.output_type == "prose" and
+                any(kw in consumer.goal.lower() for kw in
+                    ["calculate", "compute", "average", "total", "sum"])):
+            return CritiqueIssue(
+                severity="warning",
+                issue_type="context_mismatch",
+                task_order=consumer.task_order,
+                description=f"Task {consumer.task_order} does computation but Task {producer.task_order} produces prose. CodingAgent will need to parse unstructured text.",
+                suggested_fix="Add a parsing task between them, or explicitly instruct CodingAgent to extract values from prose context."
+            )
+
+        return None
+
+    @classmethod
+    def _build_prompt(cls, plan: PlanSchema, existing_issues: list[CritiqueIssue]) -> str:
+        """Build the LLM critique prompt."""
+        task_summary = []
+        for task in plan.tasks:
+            contract_info = ""
+            if task.output_contract:
+                contract_info = (
+                    f"\n     Contract: {task.output_contract.output_type} — "
+                    f"{task.output_contract.output_format}"
+                    f"\n     Consumed by tasks: {task.output_contract.required_by_tasks}"
+                )
+            task_summary.append(f"  Task {task.task_order}: {task.goal}{contract_info}")
+
+        tasks_text = "\n".join(task_summary)
+
+        existing_text = ""
+        if existing_issues:
+            existing_text = "\n\nDETERMINISTIC CHECKS ALREADY FOUND:\n"
+            for issue in existing_issues:
+                existing_text += f"  - Task {issue.task_order}: [{issue.issue_type}] {issue.description}\n"
+
+        return f"""Review this execution plan for a multi-agent AI system.
+
+PLAN ({len(plan.tasks)} tasks):
+{tasks_text}
+{existing_text}
+
+Analyze for these failure modes:
+
+1. CONTEXT MISMATCH: Does any task assume a specific data format from a previous task
+   that won't actually be produced?
+   Example: Task 2 calls calculate(protein_g=X) but Task 1 returns prose —
+   the value is not directly extractable.
+
+2. MISSING TASKS: Is there an implicit step the planner skipped?
+   Example: "Read CSV → Save summary" with no analysis task between them.
+
+3. WRONG AGENT: Will TaskRouter misroute any task?
+   TaskRouter uses keyword matching. "Analyze the data" has no file/code/research
+   keywords and defaults to CodingAgent. Is that correct?
+
+4. OVER-DECOMPOSED: Are any tasks redundant or unnecessarily split?
+   Example: "Save research results" + "Write results to file" are the same task.
+
+5. BAD CONTRACT: Is any output contract vague, wrong, or inconsistent with what
+   the assigned agent will actually produce?
+
+For each issue: specify severity (blocking/warning), task_order, issue_type, description, suggested_fix.
+If the plan is correct, set approved=true with empty issues list.
+Only flag real problems, not theoretical ones.
+
+Return JSON matching CritiqueResult schema."""
+
+    @classmethod
+    def apply_revisions(cls, plan: PlanSchema, critique: CritiqueResult) -> PlanSchema:
+        """
+        Apply critic's suggested goal rewrites to the plan.
+        Only rewrites goals - does not add/remove tasks.
+        Structural changes (missing tasks) require replanning.
+        """
+        if not critique.revised_goals:
+            return plan
+
+        print(f"\n   📝 Applying {len(critique.revised_goals)} revision(s)...")
+
+        for task_order, new_goal in critique.revised_goals.items():
+            for task in plan.tasks:
+                if task.task_order == task_order:
+                    print(f"   Task {task_order} revised:")
+                    print(f"     Before: {task.goal[:70]}...")
+                    print(f"     After:  {new_goal[:70]}...")
+                    task.goal = new_goal
+
+        return plan
 ```
 
-**Step 3** — Update `SpecGenerator._pascal_to_snake()` to delegate to the shared function:
+---
+
+## Step 3: Add contract generation to hierarchical.py
+
+### 3a. Add ContractResult model at the top of hierarchical.py (alongside DecompositionResult):
 
 ```python
-@staticmethod
-def _pascal_to_snake(name: str) -> str:
-    return _to_snake_case(name)
+class ContractResult(BaseModel):
+    """LLM response for output contract generation."""
+    output_type: str  # validated against allowed literals after
+    output_format: str
+    required_by_tasks: list[int]
 ```
 
-### What Changes in Practice
-
-The fix happens at Pydantic parse time — before `_decompose_task_from_spec` builds the
-task goal string. No changes needed anywhere downstream.
-
-Before:
-```
-output_file: "outputs/ImageCropper.py"
-goal: "Write `outputs/ImageCropper.py` Python module."
-```
-
-After:
-```
-output_file: "outputs/image_cropper.py"
-goal: "Write `outputs/image_cropper.py` Python module."
-```
-
----
-
-## Fix 2: Force Concrete `core_capability` in `_extract_intent`
-
-### Problem
-
-The model satisfies the schema with tautological values:
-- "implement image cropping functionality"  — restates the action
-- "handle user authentication"             — describes the layer, not the mechanism
-- "store user data"                        — meaningless
-
-These pass schema validation but give `_design_components` nothing actionable. The
-downstream effect is generic interfaces like `execute(input: str) -> str`.
-
-The current prompt gives one good example (image generation API) but a 7B model
-generalises poorly from one example. It matches the surface form of the schema field
-without matching the substance.
-
-### Solution
-
-**Change A** — Rewrite the `core_capability` instruction block with matched BAD/GOOD pairs
-that show the exact failure mode. Add a curated list of standard library defaults so the
-model has concrete options when the user hasn't specified one.
-
-Replace the existing `core_capability` block in `_extract_intent`'s prompt:
-
-```
-# BEFORE
-core_capability: The specific technical mechanism that makes primary_action possible.
-  - Name the algorithm, API, or data operation required
-  - Be concrete: "call image generation API (e.g. Stable Diffusion)" not "handle user input"
-  - If multiple options exist, pick the most appropriate and note it is assumed
-
-# AFTER
-core_capability: The specific Python library, function, or API that implements primary_action.
-  - MUST name a concrete library or API call — never describe behavior in general terms
-  - BAD:  "implement image cropping functionality"    <- restates action, names nothing
-  - GOOD: "use Pillow's Image.crop(box) where box=(left, upper, right, lower)"
-  - BAD:  "handle HTTP requests for the web app"     <- describes layer, names nothing
-  - GOOD: "use Python's http.server.BaseHTTPRequestHandler to route GET/POST requests"
-  - BAD:  "store user data on disk"                  <- describes behavior, names nothing
-  - GOOD: "persist records as JSON using Python's built-in json module"
-  - BAD:  "generate images based on user input"      <- describes behavior, names nothing
-  - GOOD: "call the Replicate API with the user's prompt to generate an image (assumed: Replicate)"
-  - If the user did not specify a library, choose the most appropriate from this list and note it:
-      Images:      Pillow (PIL)
-      Database:    sqlite3
-      Simple data: json module
-      Tabular:     csv module
-      HTTP client: requests
-      HTTP server: http.server.BaseHTTPRequestHandler
-      Image gen:   Replicate API or Stable Diffusion (local)
-```
-
-**Change B** — Lower temperature from 0.1 to 0.0 on this call. Intent extraction is
-deterministic — there is one correct primary action for any given request.
+### 3b. Add _generate_contracts as a classmethod on HierarchicalPlanner:
 
 ```python
-# BEFORE
-temperature=0.1  # Intentionally low — extraction is deterministic
+@classmethod
+def _generate_contracts(cls, tasks: list[TaskSchema]) -> tuple[list[TaskSchema], int]:
+    """
+    Generate output contracts for a list of tasks.
+    Called after decomposition, before returning leaf tasks.
+    Only runs when there are 2+ tasks (single tasks don't need contracts).
 
-# AFTER
-temperature=0.0  # Greedy decoding — extraction is fully deterministic
+    Returns:
+        tuple: (tasks_with_contracts, tokens_used)
+    """
+    if len(tasks) < 2:
+        return tasks, 0
+
+    task_descriptions = "\n".join([
+        f"Task {t.task_order}: {t.goal}" for t in tasks
+    ])
+
+    total_tokens = 0
+    valid_types = ["python_code", "prose", "structured_data", "file_path", "none"]
+
+    for task in tasks:
+        prompt = f"""All tasks in this plan:
+{task_descriptions}
+
+For Task {task.task_order}: "{task.goal}"
+
+What does this task produce?
+
+output_type options:
+- "python_code": task generates Python functions/scripts
+- "prose": task generates text (research summaries, analysis, descriptions)
+- "structured_data": task generates parseable data (JSON, CSV, key-value pairs)
+- "file_path": task writes a file and returns the path string
+- "none": task has no meaningful output for downstream tasks
+
+output_format: Describe specifically what the output looks like.
+  python_code example: "function calculate_macros(grams: float) -> dict"
+  prose example: "paragraph summary with cited sources"
+  structured_data example: "dict with keys: protein_g, fat_g, carbs_g as floats"
+  file_path example: "path string like outputs/2024-01-01_summary.txt"
+
+required_by_tasks: Which task numbers (by task_order) consume this output?
+  Look at the other tasks - which ones depend on or reference this task's result?
+
+Return JSON with output_type, output_format, required_by_tasks."""
+
+        result, tokens = call_ollama_structured(
+            model=cls.model,
+            prompt=prompt,
+            system="You are a software architect. Specify exact data contracts between system components. Be precise about types and formats.",
+            response_schema=ContractResult,
+            temperature=0.1
+        )
+        total_tokens += tokens
+
+        output_type = result.output_type if result.output_type in valid_types else "prose"
+
+        task.output_contract = OutputContract(
+            output_type=output_type,
+            output_format=result.output_format,
+            required_by_tasks=result.required_by_tasks
+        )
+
+        print(f"      📋 Task {task.task_order} contract: {output_type} — {result.output_format[:60]}...")
+
+    return tasks, total_tokens
 ```
 
-If `call_ollama_structured` raises on `temperature=0.0`, use `0.05` and add a comment.
+### 3c. Call _generate_contracts at the end of create_plan, before returning:
 
-### Expected Output Delta
+Find the end of `create_plan` where leaf_tasks are assembled, and add:
 
-Before:
-```
-[Intent] Core capability:  implement image cropping functionality
-→ Component [0] interface: execute(input: str) -> str
-```
+```python
+# Generate output contracts for multi-task plans
+if len(leaf_tasks) >= 2:
+    print(f"\n📋 Generating output contracts...")
+    leaf_tasks, contract_tokens = cls._generate_contracts(leaf_tasks)
+    total_tokens += contract_tokens
 
-After:
-```
-[Intent] Core capability:  use Pillow's Image.crop(box) where box=(left, upper, right, lower)
-→ Component [0] interface: crop(image_path: str, box: tuple) -> str
+# ... then continue with building the plan as before
 ```
 
-The CodingAgent receives the concrete interface in its task goal and can write correct
-Pillow code without having to infer what "implement cropping" means.
+### 3d. Add OutputContract import to hierarchical.py:
+
+```python
+from schemas import TaskSchema, PlanSchema, RequestSchema, OutputContract
+```
 
 ---
 
-## Validation
+## Step 4: Update agents/planning/__init__.py
 
-```bash
-python plan.py "build a web app that allows users to crop images"
-python plan.py "build a web app that allows users to turn their written art ideas into a picture"
-python plan.py "build a note-taking app with save, load, and search"
+Add CritiqueAgent to exports:
+
+```python
+from .planner import PlanningAgent
+from .classifier import TaskClassifier, TaskVerdict
+from .hierarchical import HierarchicalPlanner
+from .critic import CritiqueAgent
+
+__all__ = ['PlanningAgent', 'TaskClassifier', 'TaskVerdict', 'HierarchicalPlanner', 'CritiqueAgent']
 ```
 
-### Pass Criteria
+---
 
-**Fix 1 — snake_case filenames:**
-- [ ] All `output_file` values are `outputs/snake_case_name.py` — no uppercase after `outputs/`
-- [ ] `ImageCropper` → `outputs/image_cropper.py`
-- [ ] `ArtIdeaServer` → `outputs/art_idea_server.py`
-- [ ] If a component named `HTTPServer` appears → `outputs/http_server.py` (acronym case)
-- [ ] Goal strings in task list reflect corrected filenames
+## Step 5: Update orchestrator.py
 
-**Fix 2 — concrete core_capability:**
-- [ ] Cropping request: `[Intent] Core capability` mentions Pillow and `Image.crop`
-- [ ] Art ideas request: capability mentions a named image generation API
-- [ ] Note-taking request: capability mentions `json`, `sqlite3`, or equivalent by name
-- [ ] Component [0] interface is domain-specific, not `execute(input: str) -> str`
-- [ ] No `core_capability` value ends with the word "functionality"
+### 5a. Add import at top:
+
+```python
+from ..planning.critic import CritiqueAgent
+```
+
+### 5b. Replace Stage 1 in execute_request with this expanded version:
+
+```python
+# === STAGE 1: PLANNING ===
+print(f"\n📋 Stage 1: Planning")
+
+if USE_HIERARCHICAL_PLANNING:
+    print(f"   Using: HierarchicalPlanner (with classifier)")
+    plan = HierarchicalPlanner.create_plan(request)
+else:
+    print(f"   Using: PlanningAgent (flat planning)")
+    plan = PlanningAgent.create_plan(request)
+
+print(f"   Generated {len(plan.tasks)} task(s)")
+save_plan_to_sqlite(plan)
+print(f"   💾 Saved plan after planning")
+
+# === STAGE 1.5: CRITIQUE ===
+print(f"\n🔎 Stage 1.5: Plan Critique")
+
+critique, critique_tokens = CritiqueAgent.critique_plan(plan)
+plan.token_usage += critique_tokens
+
+if not critique.approved:
+    print(f"\n   🔄 Blocking issues found, attempting revision...")
+
+    # Apply goal rewrites first (cheap fix)
+    if critique.revised_goals:
+        plan = CritiqueAgent.apply_revisions(plan, critique)
+
+    # If missing tasks detected, full replan with critique context
+    missing_task_issues = [
+        i for i in critique.issues
+        if i.issue_type == "missing_task" and i.severity == "blocking"
+    ]
+
+    if missing_task_issues:
+        print(f"   🔁 Missing tasks detected - replanning with critique context...")
+        plan = self._replan_with_critique(request, critique)
+        plan.token_usage += critique_tokens  # approximate
+
+    save_plan_to_sqlite(plan)
+    print(f"   💾 Saved revised plan")
+
+else:
+    # Apply any non-blocking goal rewrites
+    if critique.revised_goals:
+        plan = CritiqueAgent.apply_revisions(plan, critique)
+        save_plan_to_sqlite(plan)
+```
+
+### 5c. Add _replan_with_critique as a method on Orchestrator:
+
+```python
+def _replan_with_critique(self, request: RequestSchema, critique: CritiqueResult) -> PlanSchema:
+    """
+    Replan incorporating critique feedback.
+    Injects blocking issues as context into the planner.
+    Only called when missing_task blocking issues exist.
+    """
+    issues_text = "\n".join([
+        f"- {i.description} → Fix: {i.suggested_fix}"
+        for i in critique.issues
+        if i.severity == "blocking"
+    ])
+
+    augmented_content = f"""{request.content}
+
+PLANNING NOTES (from previous attempt - these issues must be fixed):
+{issues_text}"""
+
+    augmented_request = RequestSchema(
+        request_id=request.request_id,
+        content=augmented_content
+    )
+
+    if USE_HIERARCHICAL_PLANNING:
+        return HierarchicalPlanner.create_plan(augmented_request)
+    else:
+        return PlanningAgent.create_plan(augmented_request)
+```
+
+### 5d. Add CritiqueResult import to orchestrator.py:
+
+```python
+from schemas import RequestSchema, PlanSchema, TaskSchema, CritiqueResult
+```
 
 ---
 
-## Files to Change
+## Success Criteria
 
-| File | Change |
-|------|--------|
-| `ai_intern/planning/spec_generator.py` | Add `_to_snake_case()` module-level function; add `field_validator` to `ComponentSpec`; update `_extract_intent` prompt `core_capability` block; change temperature to `0.0`; update `_pascal_to_snake()` to delegate to `_to_snake_case()` |
+- [ ] Plans with 3+ tasks show "Stage 1.5: Plan Critique" in output
+- [ ] Plans with < 3 tasks skip critique cleanly
+- [ ] Output contracts appear on each task after planning
+- [ ] Blocking issues prevent execution and trigger revision
+- [ ] Warnings log but don't block execution
+- [ ] Replan path fires when missing_task blocking issues found
+- [ ] Token usage includes critique tokens in plan.token_usage
+- [ ] Existing simple tests (fibonacci, single task) still pass unchanged
 
-One file. No schema changes. No changes to `hierarchical.py`, `schemas.py`, or any other file.
+## Test After Implementation
 
----
+```python
+# Test 1: Simple plan (critique skipped)
+request = RequestSchema(content="Write a fibonacci function")
+plan = orchestrator.execute_request(request)
+# Should show: "Skipping critique (only 1 task)"
 
-## Notes for Claude Code
+# Test 2: Multi-task plan (critique runs)
+request = RequestSchema(content="Research chicken thigh macros and write a calculator, save as calc.py")
+plan = orchestrator.execute_request(request)
+# Should show: Stage 1.5 output with contracts and critique result
+# Check: plan.tasks[0].output_contract is not None
+```
 
-The two regex substitutions in `_to_snake_case` must run in sequence — the second only
-makes sense after the first has run. Do not combine them into one pattern.
+## Constraints
+- DO NOT change TaskRouter keyword lists
+- DO NOT change existing agent execute_task signatures
+- DO NOT change validation logic
+- DO NOT add async
+- Keep all existing tests passing
+- OutputContract field on TaskSchema must be Optional (backward compatible with existing DB rows)
 
-Do not normalise `ComponentSpec.name` — it stays PascalCase. `name` is used in
-`depends_on` references and in goal strings where PascalCase is intentional and correct.
-Only `output_file` gets normalised.
+## Notes
 
-The `normalise_output_file` validator uses `mode="before"` so it runs on the raw LLM
-string before any other Pydantic coercion. This is correct — do not change the mode.
+**Why two-pass critique (deterministic + LLM)?**
+Deterministic checks catch routing mismatches and contract/agent type conflicts instantly
+with zero token cost. The LLM pass catches semantic issues (missing steps, context mismatches)
+that require understanding the task goals. Running deterministic first means the LLM prompt
+already has known issues listed, so it focuses on finding new ones rather than re-finding obvious ones.
 
-If the safety net (`_inject_capability_component`) fires after these changes, its
-`output_file` construction already calls `_pascal_to_snake()` which now delegates to
-`_to_snake_case()` — so the safety net path is also fixed automatically.
+**Why only replan on missing_task blocking issues?**
+Goal rewrites are cheap - apply in place. Adding/removing tasks requires the planner
+to regenerate the whole structure. Keeping these paths separate prevents over-engineering
+the revision loop.
+
+**Token cost estimate:**
+Contract generation: ~1 LLM call per task on 3+ task plans = 3-4 extra calls
+Critique pass: 1 LLM call per plan
+Replan (rare): 1 full planning pass
+Total overhead on a typical 3-task plan: ~4-5 extra LLM calls, ~60-90 seconds on your hardware.

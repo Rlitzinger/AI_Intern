@@ -1,8 +1,9 @@
-from ..schemas import RequestSchema, PlanSchema, TaskSchema, TaskOutput
+from ..schemas import RequestSchema, PlanSchema, TaskSchema, TaskOutput, CritiqueResult
 from ..storage import save_plan_to_sqlite
 from .routing import TaskRouter
 from ..planning.planner import PlanningAgent
 from ..planning.hierarchical import HierarchicalPlanner
+from ..planning.critic import CritiqueAgent
 from ..validation.validator import ValidationAgent
 from ..validation.error_classifier import ErrorClassifier, ErrorCategory
 from ..workspace import ProjectWorkspace
@@ -33,16 +34,55 @@ class Orchestrator:
         request.content = preprocess_request(request.content)
 
         # === STAGE 1: PLANNING ===
+        print(f"\nStage 1: Planning")
         logger.info("Stage 1: Planning")
 
         if settings.USE_HIERARCHICAL_PLANNING:
+            print(f"   Using: HierarchicalPlanner (with classifier)")
             logger.info("Using: HierarchicalPlanner (with classifier)")
             plan = HierarchicalPlanner.create_plan(request)
         else:
+            print(f"   Using: PlanningAgent (flat planning)")
             logger.info("Using: PlanningAgent (flat planning)")
             plan = PlanningAgent.create_plan(request)
 
+        print(f"   Generated {len(plan.tasks)} task(s)")
         logger.info(f"Generated {len(plan.tasks)} task(s)")
+        save_plan_to_sqlite(plan)
+        print(f"   Saved plan after planning")
+
+        # === STAGE 1.5: CRITIQUE ===
+        print(f"\nStage 1.5: Plan Critique")
+
+        critique, critique_tokens = CritiqueAgent.critique_plan(plan)
+        plan.token_usage += critique_tokens
+
+        if not critique.approved:
+            print(f"\n   Blocking issues found, attempting revision...")
+
+            # Apply goal rewrites first (cheap fix)
+            if critique.revised_goals:
+                plan = CritiqueAgent.apply_revisions(plan, critique)
+
+            # If missing tasks detected, full replan with critique context
+            missing_task_issues = [
+                i for i in critique.issues
+                if i.issue_type == "missing_task" and i.severity == "blocking"
+            ]
+
+            if missing_task_issues:
+                print(f"   Missing tasks detected - replanning with critique context...")
+                plan = self._replan_with_critique(request, critique)
+                plan.token_usage += critique_tokens  # approximate
+
+            save_plan_to_sqlite(plan)
+            print(f"   Saved revised plan")
+
+        else:
+            # Apply any non-blocking goal rewrites
+            if critique.revised_goals:
+                plan = CritiqueAgent.apply_revisions(plan, critique)
+                save_plan_to_sqlite(plan)
 
         # Log app spec summary if one was generated
         if plan.app_spec:
@@ -66,9 +106,6 @@ class Orchestrator:
         for task in plan.tasks:
             if not task.original_goal:
                 task.original_goal = task.goal
-
-        save_plan_to_sqlite(plan)
-        logger.debug("Saved plan after planning")
 
         # === STAGE 2: EXECUTION + VALIDATION (with retries) ===
         logger.info("Stage 2: Execution & Validation")
@@ -183,7 +220,8 @@ class Orchestrator:
             }
 
             # Inject workspace context for tasks that depend on prior components
-            if workspace and task.output_contract:
+            # Only for spec-driven (dict) contracts, not planning OutputContract models
+            if workspace and isinstance(task.output_contract, dict):
                 depends_on_names = task.output_contract.get("depends_on", [])
                 # Fall back to spec component depends_on if not in contract
                 if not depends_on_names and plan.app_spec:
@@ -241,7 +279,7 @@ class Orchestrator:
                     self._try_execute_code(task)
 
                 # Register component in workspace manifest and write file
-                if workspace and task.output_contract:
+                if workspace and isinstance(task.output_contract, dict):
                     contract = task.output_contract
                     raw_output_file = contract.get("output_file", "")
                     # Derive the filename within the workspace
@@ -475,6 +513,33 @@ class Orchestrator:
             logger.debug(f"Code execution skipped: {e}")
         finally:
             os.unlink(temp_path)
+
+    def _replan_with_critique(self, request: RequestSchema, critique: CritiqueResult) -> PlanSchema:
+        """
+        Replan incorporating critique feedback.
+        Injects blocking issues as context into the planner.
+        Only called when missing_task blocking issues exist.
+        """
+        issues_text = "\n".join([
+            f"- {i.description} -> Fix: {i.suggested_fix}"
+            for i in critique.issues
+            if i.severity == "blocking"
+        ])
+
+        augmented_content = f"""{request.content}
+
+PLANNING NOTES (from previous attempt - these issues must be fixed):
+{issues_text}"""
+
+        augmented_request = RequestSchema(
+            request_id=request.request_id,
+            content=augmented_content
+        )
+
+        if settings.USE_HIERARCHICAL_PLANNING:
+            return HierarchicalPlanner.create_plan(augmented_request)
+        else:
+            return PlanningAgent.create_plan(augmented_request)
 
     @staticmethod
     def _auto_detect_dependencies(plan: PlanSchema):

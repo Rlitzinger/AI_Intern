@@ -114,3 +114,11 @@
 - available libary awareness
 - structure retry prmpting with category-aware correction prompts
 - kv cache values passed to coding agent
+
+# 3/4/2025
+- did a lot more work on the planner
+- added a better classification of the planner
+- provided context to the planner on what agents are available
+- made a clear part of the plan to focus on exact user reqs (we were just making the same CRUD app without specifics over and over)
+- added a critiqueagent and output contract
+- updated the plan.py to better show details of what happened during the planning phase, and the thinking/reasoning

@@ -1,4 +1,4 @@
-from ..schemas import TaskSchema, PlanSchema, RequestSchema, SubtaskSpec
+from ..schemas import TaskSchema, PlanSchema, RequestSchema, SubtaskSpec, OutputContract
 from .classifier import TaskClassifier, TaskVerdict
 from .spec_generator import SpecGenerator, AppSpec
 from .context import PlanningContext
@@ -37,6 +37,13 @@ class DecompositionResult(BaseModel):
             else:
                 coerced.append(item)
         return coerced
+
+
+class ContractResult(BaseModel):
+    """LLM response for output contract generation."""
+    output_type: str  # validated against allowed literals after
+    output_format: str
+    required_by_tasks: list[int]
 
 
 class ClarificationResult(BaseModel):
@@ -131,6 +138,13 @@ class HierarchicalPlanner:
             task.task_order = i
             plan.tasks.append(task)
 
+        # Generate output contracts for multi-task plans
+        if len(leaf_tasks) >= 2:
+            print(f"\nGenerating output contracts...")
+            leaf_tasks, contract_tokens = cls._generate_contracts(leaf_tasks)
+            total_tokens += contract_tokens
+            plan.token_usage = total_tokens
+
         logger.info(f"Hierarchical plan created: {len(plan.tasks)} executable tasks")
         logger.debug(f"Tokens consumed: {total_tokens}")
 
@@ -151,7 +165,7 @@ class HierarchicalPlanner:
             tuple: (list of executable leaf tasks, total tokens used)
         """
         indent = "  " * depth
-        logger.info(f"{indent}Classifying: {task.goal[:60]}...")
+        logger.info(f"{indent}Classifying: {task.goal}")
 
         # Check max depth
         if depth >= cls.max_depth:
@@ -179,7 +193,7 @@ class HierarchicalPlanner:
                 logger.info(f"{indent}App-scale overridden by keyword safety net")
 
         logger.info(f"{indent}Verdict: {verdict.value} | app_scale={is_app_scale}")
-        logger.debug(f"{indent}Reasoning: {reasoning[:80]}...")
+        logger.debug(f"{indent}Reasoning: {reasoning}")
 
         # Handle based on verdict
         if verdict == TaskVerdict.EXECUTE and is_app_scale:
@@ -222,7 +236,7 @@ class HierarchicalPlanner:
             # Recursively decompose each subtask
             all_leaf_tasks = []
             for i, subtask in enumerate(subtasks):
-                logger.info(f"{indent}  Subtask {i}: {subtask.goal[:50]}...")
+                logger.info(f"{indent}  Subtask {i}: {subtask.goal}")
 
                 # Create context for subtask — carry root_clarified_goal forward
                 subtask_context = {
@@ -249,7 +263,7 @@ class HierarchicalPlanner:
             clarified_task, clarify_tokens = cls._clarify_task(task, context)
             total_tokens += clarify_tokens
 
-            logger.info(f"{indent}Clarified: {clarified_task.goal[:60]}...")
+            logger.info(f"{indent}Clarified: {clarified_task.goal}")
 
             # After clarification, it should be executable
             # (Don't recurse - assume clarification makes it executable)
@@ -285,7 +299,7 @@ class HierarchicalPlanner:
                 clarified_task, clarify_tokens = cls._clarify_task(task, context)
                 total_tokens += clarify_tokens
 
-            logger.info(f"{indent}Clarified: {clarified_task.goal[:60]}...")
+            logger.info(f"{indent}Clarified: {clarified_task.goal}")
             logger.info(f"{indent}Now decomposing clarified task...")
 
             # Lock in the clarified goal so ALL downstream decompositions see it
@@ -299,7 +313,7 @@ class HierarchicalPlanner:
             # Recursively decompose each subtask
             all_leaf_tasks = []
             for i, subtask in enumerate(subtasks):
-                logger.info(f"{indent}  Subtask {i}: {subtask.goal[:50]}...")
+                logger.info(f"{indent}  Subtask {i}: {subtask.goal}")
 
                 subtask_context = {
                     'parent_goal': clarified_task.goal,
@@ -318,6 +332,78 @@ class HierarchicalPlanner:
                 total_tokens += sub_tokens
 
             return all_leaf_tasks, total_tokens
+
+    @classmethod
+    def _generate_contracts(cls, tasks: list[TaskSchema]) -> tuple[list[TaskSchema], int]:
+        """
+        Generate output contracts for a list of tasks.
+        Called after decomposition, before returning leaf tasks.
+        Only runs when there are 2+ tasks (single tasks don't need contracts).
+        Skips tasks that already have a spec-driven dict output_contract.
+
+        Returns:
+            tuple: (tasks_with_contracts, tokens_used)
+        """
+        if len(tasks) < 2:
+            return tasks, 0
+
+        task_descriptions = "\n".join([
+            f"Task {t.task_order}: {t.goal}" for t in tasks
+        ])
+
+        total_tokens = 0
+        valid_types = ["python_code", "prose", "structured_data", "file_path", "none"]
+
+        for task in tasks:
+            # Skip spec-driven tasks that already have a dict output_contract
+            if isinstance(task.output_contract, dict):
+                continue
+
+            prompt = f"""All tasks in this plan:
+{task_descriptions}
+
+For Task {task.task_order}: "{task.goal}"
+
+What does this task produce?
+
+output_type options:
+- "python_code": task generates Python functions/scripts
+- "prose": task generates text (research summaries, analysis, descriptions)
+- "structured_data": task generates parseable data (JSON, CSV, key-value pairs)
+- "file_path": task writes a file and returns the path string
+- "none": task has no meaningful output for downstream tasks
+
+output_format: Describe specifically what the output looks like.
+  python_code example: "function calculate_macros(grams: float) -> dict"
+  prose example: "paragraph summary with cited sources"
+  structured_data example: "dict with keys: protein_g, fat_g, carbs_g as floats"
+  file_path example: "path string like outputs/2024-01-01_summary.txt"
+
+required_by_tasks: Which task numbers (by task_order) consume this output?
+  Look at the other tasks - which ones depend on or reference this task's result?
+
+Return JSON with output_type, output_format, required_by_tasks."""
+
+            result, tokens = call_ollama_structured(
+                model=cls.model,
+                prompt=prompt,
+                system="You are a software architect. Specify exact data contracts between system components. Be precise about types and formats.",
+                response_schema=ContractResult,
+                temperature=0.1
+            )
+            total_tokens += tokens
+
+            output_type = result.output_type if result.output_type in valid_types else "prose"
+
+            task.output_contract = OutputContract(
+                output_type=output_type,
+                output_format=result.output_format,
+                required_by_tasks=result.required_by_tasks
+            )
+
+            print(f"      Task {task.task_order} contract: {output_type} -- {result.output_format[:60]}...")
+
+        return tasks, total_tokens
 
     @classmethod
     def _decompose_task(
