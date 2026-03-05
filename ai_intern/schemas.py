@@ -110,3 +110,71 @@ class AgentResult(NamedTuple):
     """Standard return type for agent execute_task methods."""
     task: TaskSchema
     tokens_used: int
+
+
+# ---------------------------------------------------------------------------
+# Red Team Council schemas
+# ---------------------------------------------------------------------------
+
+class RedTeamFinding(BaseModel):
+    """A single finding from one red team agent."""
+    # NOTE: agent is NOT in the LLM schema -- set server-side after the call.
+    # It is Optional here so Pydantic doesn't reject LLM output that omits it.
+    agent: Optional[str] = None
+    task_index: int = -1      # -1 = plan-level finding, not task-specific
+    finding_type: str         # see per-agent prompt for valid values
+    description: str
+    evidence: str
+    severity: Literal["block", "warn"]
+    # Original index in all_r1_findings -- set by council, not LLM
+    original_index: Optional[int] = None
+
+
+class FindingsResult(BaseModel):
+    """Wrapper schema for LLM findings response."""
+    findings: list[RedTeamFinding]
+
+
+class CrossExamResponse(BaseModel):
+    """One agent's response to a finding (references global finding index)."""
+    finding_index: int        # Index into all_r1_findings (global, not local)
+    verdict: Literal["confirm", "dispute", "extend"]
+    reasoning: str
+    additional_evidence: str = ""
+
+
+class CrossExamResult(BaseModel):
+    responses: list[CrossExamResponse]
+
+
+class BlueTeamResponse(BaseModel):
+    """Planner's rebuttal attempt. finding_index refs all_r1_findings."""
+    finding_index: int        # Index into all_r1_findings (global)
+    can_rebut: bool
+    rebuttal: str = ""
+
+
+class BlueTeamResult(BaseModel):
+    responses: list[BlueTeamResponse]
+
+
+class ConstraintManifest(BaseModel):
+    """Structured re-planning constraints. NOT freeform text."""
+    task_constraints: dict[int, str]     # task_index -> constraint string
+    structural_constraints: list[str]
+    must_include_tasks: list[str]
+    must_not_combine: list[list[str]]    # list[list[str]] not list[tuple] -- JSON compat
+
+
+class CouncilVerdict(BaseModel):
+    """Final output of the Red Team Council."""
+    approved: bool
+    confidence_scores: dict[int, float]        # finding original_index -> score
+    high_confidence_findings: list[RedTeamFinding]
+    constraint_manifest: Optional[ConstraintManifest] = None
+    rounds_used: int
+    total_tokens: int
+    session_id: str                            # links original + re-plan cycles
+    all_findings: list[RedTeamFinding]         # all R1 findings with original_index set
+    cross_exam_responses: list[CrossExamResponse]
+    blue_team_responses: list[BlueTeamResponse]

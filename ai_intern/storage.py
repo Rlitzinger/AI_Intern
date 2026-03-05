@@ -14,10 +14,70 @@ def get_db_connection() -> sqlite3.Connection:
     return conn
 
 
+def ensure_critique_history_table(conn: sqlite3.Connection):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS plan_critique_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            plan_id TEXT NOT NULL,
+            request_content TEXT,
+            cycle INTEGER NOT NULL DEFAULT 0,
+            round TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            finding_type TEXT,
+            task_index INTEGER,
+            severity TEXT,
+            content TEXT NOT NULL,
+            confidence_score REAL,
+            verdict TEXT,
+            survived_revision INTEGER DEFAULT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+
+
+def save_critique_event(
+    session_id: str,
+    plan_id: str,
+    request_content: str,
+    cycle: int,
+    round_name: str,
+    agent: str,
+    content: str,
+    finding_type: str = None,
+    task_index: int = None,
+    severity: str = None,
+    confidence_score: float = None,
+    verdict: str = None,
+):
+    with get_db_connection() as conn:
+        ensure_critique_history_table(conn)
+        conn.execute("""
+            INSERT INTO plan_critique_history
+                (session_id, plan_id, request_content, cycle, round, agent,
+                 finding_type, task_index, severity, content, confidence_score, verdict)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            session_id, plan_id, request_content, cycle, round_name, agent,
+            finding_type, task_index, severity, content, confidence_score, verdict
+        ))
+
+
+def mark_findings_survived(session_id: str, cycle: int, survived: bool):
+    """Mark whether findings from this cycle persisted into the next."""
+    with get_db_connection() as conn:
+        conn.execute("""
+            UPDATE plan_critique_history
+            SET survived_revision = ?
+            WHERE session_id = ? AND cycle = ?
+        """, (1 if survived else 0, session_id, cycle))
+
+
 def save_plan_to_sqlite(plan: PlanSchema):
     """Save plan to database using context manager for safety."""
     try:
         with get_db_connection() as conn:
+            ensure_critique_history_table(conn)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS plans (
                     plan_id TEXT PRIMARY KEY,

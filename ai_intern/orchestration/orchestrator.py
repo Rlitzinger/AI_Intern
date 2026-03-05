@@ -1,9 +1,9 @@
-from ..schemas import RequestSchema, PlanSchema, TaskSchema, TaskOutput, CritiqueResult
-from ..storage import save_plan_to_sqlite
+from ..schemas import RequestSchema, PlanSchema, TaskSchema, TaskOutput, CritiqueResult, ConstraintManifest
+from ..storage import save_plan_to_sqlite, mark_findings_survived
 from .routing import TaskRouter
 from ..planning.planner import PlanningAgent
 from ..planning.hierarchical import HierarchicalPlanner
-from ..planning.critic import CritiqueAgent
+from ..planning.red_team.council import RedTeamCouncil
 from ..validation.validator import ValidationAgent
 from ..validation.error_classifier import ErrorClassifier, ErrorCategory
 from ..workspace import ProjectWorkspace
@@ -51,38 +51,38 @@ class Orchestrator:
         save_plan_to_sqlite(plan)
         print(f"   Saved plan after planning")
 
-        # === STAGE 1.5: CRITIQUE ===
-        print(f"\nStage 1.5: Plan Critique")
+        # === STAGE 1.5: RED TEAM COUNCIL ===
+        print(f"\nStage 1.5: Red Team Council")
 
-        critique, critique_tokens = CritiqueAgent.critique_plan(plan)
-        plan.token_usage += critique_tokens
+        # session_id persists across re-plan cycles for Historian linking
+        import uuid as _uuid
+        council_session_id = str(_uuid.uuid4())
 
-        if not critique.approved:
-            print(f"\n   Blocking issues found, attempting revision...")
+        council_verdict, council_tokens = RedTeamCouncil.review(
+            plan, request, cycle=0, session_id=council_session_id
+        )
+        plan.token_usage += council_tokens
 
-            # Apply goal rewrites first (cheap fix)
-            if critique.revised_goals:
-                plan = CritiqueAgent.apply_revisions(plan, critique)
+        if not council_verdict.approved and council_verdict.constraint_manifest:
+            n = len(council_verdict.high_confidence_findings)
+            print(f"\n   {n} blocking issue(s) -- replanning with constraints...")
 
-            # If missing tasks detected, full replan with critique context
-            missing_task_issues = [
-                i for i in critique.issues
-                if i.issue_type == "missing_task" and i.severity == "blocking"
-            ]
+            plan = self._replan_with_manifest(request, council_verdict.constraint_manifest)
+            plan.token_usage += council_tokens  # approximate
 
-            if missing_task_issues:
-                print(f"   Missing tasks detected - replanning with critique context...")
-                plan = self._replan_with_critique(request, critique)
-                plan.token_usage += critique_tokens  # approximate
+            council_verdict_2, council_tokens_2 = RedTeamCouncil.review(
+                plan, request, cycle=1, session_id=council_session_id
+            )
+            plan.token_usage += council_tokens_2
 
-            save_plan_to_sqlite(plan)
-            print(f"   Saved revised plan")
+            # Mark whether first-cycle findings survived into second cycle
+            mark_findings_survived(council_session_id, cycle=0, survived=not council_verdict_2.approved)
 
-        else:
-            # Apply any non-blocking goal rewrites
-            if critique.revised_goals:
-                plan = CritiqueAgent.apply_revisions(plan, critique)
-                save_plan_to_sqlite(plan)
+            if not council_verdict_2.approved:
+                print(f"   Issues remain after revision -- proceeding with warnings")
+
+        save_plan_to_sqlite(plan)
+        print(f"   Saved plan after council review")
 
         # Log app spec summary if one was generated
         if plan.app_spec:
@@ -514,28 +514,30 @@ class Orchestrator:
         finally:
             os.unlink(temp_path)
 
-    def _replan_with_critique(self, request: RequestSchema, critique: CritiqueResult) -> PlanSchema:
-        """
-        Replan incorporating critique feedback.
-        Injects blocking issues as context into the planner.
-        Only called when missing_task blocking issues exist.
-        """
-        issues_text = "\n".join([
-            f"- {i.description} -> Fix: {i.suggested_fix}"
-            for i in critique.issues
-            if i.severity == "blocking"
-        ])
+    def _replan_with_manifest(
+        self, request: RequestSchema, manifest: ConstraintManifest
+    ) -> PlanSchema:
+        """Re-plan with structured constraints. Not freeform feedback."""
+        lines = []
+        for task_idx, c in manifest.task_constraints.items():
+            lines.append(f"- Task {task_idx} must satisfy: {c}")
+        for c in manifest.structural_constraints:
+            lines.append(f"- STRUCTURAL: {c}")
+        for goal in manifest.must_include_tasks:
+            lines.append(f"- MUST INCLUDE A TASK FOR: {goal}")
+        for pair in manifest.must_not_combine:
+            if len(pair) == 2:
+                lines.append(f"- NEVER combine [{pair[0]}] and [{pair[1]}] in one task")
 
-        augmented_content = f"""{request.content}
-
-PLANNING NOTES (from previous attempt - these issues must be fixed):
-{issues_text}"""
-
+        augmented_content = (
+            f"{request.content}\n\n"
+            "HARD PLANNING CONSTRAINTS (non-negotiable, from adversarial review):\n"
+            + "\n".join(lines)
+        )
         augmented_request = RequestSchema(
             request_id=request.request_id,
             content=augmented_content
         )
-
         if settings.USE_HIERARCHICAL_PLANNING:
             return HierarchicalPlanner.create_plan(augmented_request)
         else:

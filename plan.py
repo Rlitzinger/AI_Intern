@@ -55,7 +55,7 @@ logging.getLogger("ai_intern").setLevel(logging.WARNING)
 from ai_intern.schemas import RequestSchema, OutputContract
 from ai_intern.planning.hierarchical import HierarchicalPlanner
 from ai_intern.planning.environment import EnvironmentScanner
-from ai_intern.planning.critic import CritiqueAgent
+from ai_intern.planning.red_team.council import RedTeamCouncil
 
 
 # --- Display helpers ----------------------------------------------------
@@ -252,62 +252,282 @@ print(f"  Tokens used     : {plan.token_usage:,}")
 
 
 # -----------------------------------------------------------------------
-# CRITIQUE PASS
-# Shows what the CritiqueAgent found — deterministic checks (zero cost)
-# followed by a full LLM review of the plan's internal consistency.
+# RED TEAM COUNCIL
+# Adversarial multi-round review: Executor, Integrator, Minimalist,
+# Cross-Examination, Blue Team Defense, Synthesis.
+#
+# Rounds:
+#   R1 - Three independent agents each find issues (no communication)
+#   R2 - Each agent reviews the others' findings (global indices stable)
+#   R3 - Planner defends plan against surviving findings
+#   R4 - Deterministic scoring (no LLM); high-confidence findings trigger R5
+#   R5 - Constraint manifest built; re-plan injected (conditional)
 # -----------------------------------------------------------------------
-_section("Stage 1.5 — Plan Critique  (CritiqueAgent)")
 
-if len(plan.tasks) < 3:
-    print(f"  Skipped: {len(plan.tasks)} task(s) — critique only runs on 3+ task plans")
-    critique = None
-    critique_tokens = 0
+def _subsection(title: str, width: int = 68):
+    print(f"  {'   ' + title}")
+    print(f"  {'  ' + '-' * (width - 2)}")
+
+def _finding_header(f, prefix=""):
+    sev_tag = "[block]" if f.severity == "block" else "[warn ]"
+    task_ref = f"Task {f.task_index:2d}" if f.task_index >= 0 else "Plan   "
+    print(f"  {prefix}[{f.original_index}] {sev_tag}  {task_ref}  {f.agent}/{f.finding_type}")
+
+def _wrap(text: str, indent: int, width: int = 66) -> list[str]:
+    """Word-wrap text to width, prefixed by indent spaces."""
+    prefix = " " * indent
+    words = text.split()
+    lines, current = [], []
+    for w in words:
+        if sum(len(x) + 1 for x in current) + len(w) > width - indent:
+            if current:
+                lines.append(prefix + " ".join(current))
+            current = [w]
+        else:
+            current.append(w)
+    if current:
+        lines.append(prefix + " ".join(current))
+    return lines
+
+def _print_wrapped(text: str, indent: int):
+    for line in _wrap(text, indent):
+        print(line)
+
+_section("Stage 1.5 -- Red Team Council  (Adversarial Review)")
+
+if len(plan.tasks) < 2:
+    print(f"  Skipped: {len(plan.tasks)} task -- council only runs on 2+ task plans")
 else:
     print(f"  Reviewing {len(plan.tasks)}-task plan...")
-    print()
-    print(f"  Step 1: Deterministic checks (zero LLM cost)")
-    print(f"    Simulates TaskRouter keyword scoring for each task.")
-    print(f"    Checks: contract type vs agent type, context format mismatches.")
-    print()
-    print(f"  Step 2: LLM critique pass")
-    print(f"    Looks for: missing tasks, wrong agent routing, over-decomposition,")
-    print(f"    context mismatches, vague contracts.")
+    print(f"  Each round's data flows into the next via global finding indices.")
     print()
 
-    critique, critique_tokens = CritiqueAgent.critique_plan(plan)
-    plan.token_usage += critique_tokens
+    # Suppress the council's live [R1]/[R2]/... print output during execution.
+    # We replay per-round detail ourselves below in structured form.
+    _stdout_buf2 = _io.StringIO()
+    sys.stdout = _stdout_buf2
+    council_verdict, council_tokens = RedTeamCouncil.review(plan, req)
+    sys.stdout = _real_stdout
+    plan.token_usage += council_tokens
 
-    blocking = [i for i in critique.issues if i.severity == "blocking"]
-    warnings  = [i for i in critique.issues if i.severity == "warning"]
+    all_findings      = council_verdict.all_findings
+    cross_responses   = council_verdict.cross_exam_responses
+    blue_responses    = council_verdict.blue_team_responses
+    confidence_scores = council_verdict.confidence_scores
+    rounds_used       = council_verdict.rounds_used
 
+    # surviving set = findings that made it past R2 filtering (have a score)
+    survived_indices = set(confidence_scores.keys())
+
+    # -----------------------------------------------------------------
+    # ROUND 1: Independent Red Team
+    # -----------------------------------------------------------------
+    print(f"  Round 1 -- Independent Red Team  ({len(all_findings)} finding(s))")
+    print(f"  " + "-" * 68)
+    print(f"  Three agents run independently. No shared state.")
+    print(f"  Each assigns a global index (immutable from this point on).")
     print()
-    status_str = "APPROVED" if critique.approved else "REJECTED (revision triggered)"
-    print(f"  Verdict         : {status_str}")
-    print(f"  Blocking issues : {len(blocking)}")
-    print(f"  Warnings        : {len(warnings)}")
-    print(f"  Tokens used     : {critique_tokens:,}")
 
-    if critique.issues:
+    for agent_name in ("executor", "integrator", "minimalist"):
+        agent_label = {
+            "executor":   "Executor   -- traces data flow task-by-task",
+            "integrator": "Integrator -- reasons about the full artifact graph",
+            "minimalist": "Minimalist -- counterfactual simplicity check",
+        }[agent_name]
+        agent_findings = [f for f in all_findings if f.agent == agent_name]
+        print(f"    {agent_label}")
+        if not agent_findings:
+            print(f"      (no findings)")
+        else:
+            for f in agent_findings:
+                sev_tag = "[block]" if f.severity == "block" else "[warn ]"
+                task_ref = f"Task {f.task_index:2d}" if f.task_index >= 0 else "Plan   "
+                print(f"      [{f.original_index}] {sev_tag}  {task_ref}  {f.finding_type}")
+                _print_wrapped(f.description, 10)
+                _print_wrapped(f"Evidence: {f.evidence}", 10)
         print()
-        print(f"  Issues:")
-        for issue in critique.issues:
-            sev = "BLOCKING" if issue.severity == "blocking" else "warning "
-            print(f"    [{sev}]  Task {issue.task_order:2d}  [{issue.issue_type}]")
-            print(f"              {issue.description}")
-            print(f"              Fix: {issue.suggested_fix}")
+
+    if rounds_used == 1:
+        print(f"  No findings -- short-circuited after R1.")
+        print()
+
+    # -----------------------------------------------------------------
+    # ROUND 2: Cross-Examination  (only if R2 ran)
+    # -----------------------------------------------------------------
+    if rounds_used >= 2 and all_findings:
+        print(f"  Round 2 -- Cross-Examination  ({len(cross_responses)} response(s))")
+        print(f"  " + "-" * 68)
+        print(f"  Each agent reviews findings NOT from itself.")
+        print(f"  Global indices passed as-is -- no re-numbering.")
+        print(f"  A single DISPUTE removes a finding from R3+.")
+        print()
+
+        for f in all_findings:
+            relevant = [r for r in cross_responses if r.finding_index == f.original_index]
+            if not relevant:
+                continue
+
+            sev_tag  = "[block]" if f.severity == "block" else "[warn ]"
+            task_ref = f"Task {f.task_index:2d}" if f.task_index >= 0 else "Plan   "
+            survived_tag = "survived" if f.original_index in survived_indices else "FILTERED"
+            print(f"    [{f.original_index}] {sev_tag}  {task_ref}  {f.agent}/{f.finding_type}  -> {survived_tag}")
+
+            confirms  = [r for r in relevant if r.verdict == "confirm"]
+            disputes  = [r for r in relevant if r.verdict == "dispute"]
+            extends   = [r for r in relevant if r.verdict == "extend"]
+
+            verdict_summary = []
+            if confirms:
+                verdict_summary.append(f"{len(confirms)} confirm")
+            if disputes:
+                verdict_summary.append(f"{len(disputes)} dispute")
+            if extends:
+                verdict_summary.append(f"{len(extends)} extend")
+            print(f"      votes: {', '.join(verdict_summary) if verdict_summary else 'none'}")
+
+            for r in relevant:
+                tag = {"confirm": "CONFIRM", "dispute": "DISPUTE", "extend": "EXTEND "}[r.verdict]
+                _print_wrapped(f"  [{tag}]  {r.reasoning}", 8)
+                if r.additional_evidence:
+                    _print_wrapped(f"  + evidence: {r.additional_evidence}", 10)
             print()
 
-    if critique.revised_goals:
-        print(f"  Revisions applied ({len(critique.revised_goals)}):")
-        for task_order, new_goal in critique.revised_goals.items():
-            for t in plan.tasks:
-                if t.task_order == task_order:
-                    print(f"    Task {task_order} before: {t.goal}")
-                    print(f"    Task {task_order} after : {new_goal}")
-
-    if critique.critique_reasoning:
+        n_survived = len(survived_indices)
+        n_filtered = len(all_findings) - n_survived
+        print(f"  Filter result: {n_survived}/{len(all_findings)} survived  ({n_filtered} removed by dispute)")
         print()
-        print(f"  LLM reasoning   : {critique.critique_reasoning}")
+
+        if rounds_used == 2:
+            print(f"  All surviving findings disputed -- short-circuited after R2.")
+            print()
+
+    # -----------------------------------------------------------------
+    # ROUND 3: Blue Team Defense  (only if R3 ran)
+    # -----------------------------------------------------------------
+    if rounds_used >= 3 and blue_responses:
+        print(f"  Round 3 -- Blue Team Defense  ({len(blue_responses)} response(s))")
+        print(f"  " + "-" * 68)
+        print(f"  Planner (as skeptical self-critic) defends against surviving findings.")
+        print(f"  Conceding a finding adds +0.25 to its confidence score.")
+        print()
+
+        for f in all_findings:
+            if f.original_index not in survived_indices:
+                continue
+            relevant_blue = [r for r in blue_responses if r.finding_index == f.original_index]
+            if not relevant_blue:
+                continue
+
+            sev_tag  = "[block]" if f.severity == "block" else "[warn ]"
+            task_ref = f"Task {f.task_index:2d}" if f.task_index >= 0 else "Plan   "
+            r = relevant_blue[0]
+            outcome = "REBUT  " if r.can_rebut else "CONCEDE"
+            print(f"    [{f.original_index}] {sev_tag}  {task_ref}  {f.agent}/{f.finding_type}")
+            print(f"      Planner: {outcome}")
+            if r.rebuttal:
+                _print_wrapped(r.rebuttal, 8)
+            print()
+
+    # -----------------------------------------------------------------
+    # ROUND 4: Synthesis  (deterministic, no LLM)
+    # -----------------------------------------------------------------
+    if rounds_used >= 4 and survived_indices:
+        from ai_intern.planning.red_team.synthesis import BLOCK_THRESHOLD, WARN_SCORE_CAP
+
+        print(f"  Round 4 -- Synthesis  (deterministic, zero LLM cost)")
+        print(f"  " + "-" * 68)
+        print(f"  Scoring breakdown per surviving finding:")
+        print(f"    base               +0.20  (found in R1)")
+        print(f"    corroborated       +0.10 per similar finding (same type+task, max +0.20)")
+        print(f"    confirmed in R2    +0.25  (>= 1 confirm)")
+        print(f"    not disputed       +0.10  (zero disputes)")
+        print(f"    blue team concede  +0.25  (can_rebut=false)")
+        print(f"    warn severity cap  capped at {WARN_SCORE_CAP:.2f}  (cannot trigger re-plan)")
+        print(f"    block threshold    {BLOCK_THRESHOLD:.2f}  -> triggers revision if exceeded")
+        print()
+
+        for f in all_findings:
+            if f.original_index not in survived_indices:
+                continue
+
+            score = confidence_scores[f.original_index]
+            sev_tag  = "[block]" if f.severity == "block" else "[warn ]"
+            task_ref = f"Task {f.task_index:2d}" if f.task_index >= 0 else "Plan   "
+            filled = int(score * 10)
+            bar = "X" * filled + "." * (10 - filled)
+            block_tag = "  => [BLOCK]" if score >= BLOCK_THRESHOLD else ""
+            print(f"    [{f.original_index}] {sev_tag}  {task_ref}  {f.agent}/{f.finding_type}")
+
+            # Reconstruct breakdown
+            idx = f.original_index
+            similar = sum(
+                1 for x in all_findings
+                if x.original_index != idx
+                and x.finding_type == f.finding_type
+                and x.task_index == f.task_index
+            )
+            relevant_cross = [r for r in cross_responses if r.finding_index == idx]
+            confirms = sum(1 for r in relevant_cross if r.verdict == "confirm")
+            disputes = sum(1 for r in relevant_cross if r.verdict == "dispute")
+            relevant_blue = [r for r in blue_responses if r.finding_index == idx]
+            blue_concede = relevant_blue and not relevant_blue[0].can_rebut
+
+            running = 0.20
+            print(f"      base             +0.20  -> {running:.2f}")
+            if similar:
+                gain = min(similar * 0.10, 0.20)
+                running += gain
+                print(f"      corroborated     +{gain:.2f}  -> {running:.2f}  ({similar} similar finding(s))")
+            if confirms >= 1:
+                running += 0.25
+                print(f"      confirmed R2     +0.25  -> {running:.2f}  ({confirms} confirm(s))")
+            if disputes == 0:
+                running += 0.10
+                print(f"      not disputed     +0.10  -> {running:.2f}")
+            if blue_concede:
+                running += 0.25
+                print(f"      blue concede     +0.25  -> {running:.2f}")
+            if f.severity == "warn" and min(running, 1.0) > WARN_SCORE_CAP:
+                print(f"      warn cap         capped {min(running,1.0):.2f} -> {WARN_SCORE_CAP:.2f}")
+            print(f"      final score      [{bar}] {score:.2f}{block_tag}")
+            print()
+
+    # -----------------------------------------------------------------
+    # ROUND 5: Constraint Manifest  (conditional)
+    # -----------------------------------------------------------------
+    if council_verdict.constraint_manifest:
+        m = council_verdict.constraint_manifest
+        total_constraints = (
+            len(m.task_constraints) + len(m.structural_constraints)
+            + len(m.must_include_tasks) + len(m.must_not_combine)
+        )
+        print(f"  Round 5 -- Constraint Manifest  ({total_constraints} constraint(s))")
+        print(f"  " + "-" * 68)
+        print(f"  High-confidence block findings triggered a re-plan.")
+        print(f"  These constraints are injected as HARD RULES into the planner.")
+        print()
+        for tidx, c in m.task_constraints.items():
+            _print_wrapped(f"  Task {tidx}: {c}", 4)
+        for c in m.structural_constraints:
+            _print_wrapped(f"  STRUCTURAL: {c}", 4)
+        for g in m.must_include_tasks:
+            _print_wrapped(f"  MUST INCLUDE: {g}", 4)
+        for pair in m.must_not_combine:
+            if len(pair) == 2:
+                print(f"    NEVER combine [{pair[0]}] and [{pair[1]}] in one task")
+        print()
+
+    # -----------------------------------------------------------------
+    # Summary line
+    # -----------------------------------------------------------------
+    status = "APPROVED" if council_verdict.approved else "REJECTED (re-plan triggered)"
+    n_block = len(council_verdict.high_confidence_findings)
+    print(f"  Verdict     : {status}")
+    print(f"  Rounds used : {rounds_used} / 5  (short-circuits when no issues survive)")
+    print(f"  R1 findings : {len(all_findings)}  "
+          f"survived R2: {len(survived_indices)}  "
+          f"block threshold: {n_block}")
+    print(f"  Tokens      : {council_tokens:,}")
 
 
 # -----------------------------------------------------------------------
