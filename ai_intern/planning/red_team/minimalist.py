@@ -18,12 +18,27 @@ If the plan is appropriately scoped, return empty findings."""
     @classmethod
     def find_issues(cls, plan: PlanSchema) -> tuple[list[RedTeamFinding], int]:
         original_request = ""
+        spec_context = ""
+
         if plan.tasks:
             original_request = plan.tasks[0].original_goal or plan.tasks[0].goal
 
+        # If this is a spec-driven plan, inject the spec's justification
+        # so Minimalist doesn't flag legitimate multi-component decomposition
+        if plan.app_spec:
+            spec = plan.app_spec
+            spec_context = (
+                f"\nThis plan was generated from an app spec. "
+                f"The SpecGenerator determined this requires {len(plan.tasks)} components "
+                f"because: {spec.get('summary', 'multi-component application')}. "
+                f"Components: {', '.join(c['name'] for c in spec.get('components', []))}. "
+                f"Only flag over-engineering if the SPEC ITSELF is wrong for the request, "
+                f"not if individual tasks seem simple in isolation."
+            )
+
         task_repr = format_plan_for_prompt(plan)
 
-        prompt = f"""Original request: "{original_request}"
+        prompt = f"""Original request: "{original_request}"{spec_context}
 
 Actual plan ({len(plan.tasks)} tasks):
 {task_repr}

@@ -10,7 +10,7 @@ if os.name == "nt":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from .storage import get_db_connection, load_latest_plan
+from .storage import get_db_connection, load_latest_plan, ensure_constraint_audit_table
 from .config import settings
 
 
@@ -166,13 +166,55 @@ def _detect_result_type(result):
         return "Text"
 
 
+def show_constraint_audit(session_id: str = None):
+    """Show constraint verification history, optionally filtered by session."""
+    with get_db_connection() as conn:
+        ensure_constraint_audit_table(conn)
+        if session_id:
+            cur = conn.execute("""
+                SELECT session_id, plan_id, replan_cycle, constraint_text, satisfied, checked_at
+                FROM constraint_audit
+                WHERE session_id = ?
+                ORDER BY replan_cycle, id
+            """, (session_id,))
+        else:
+            cur = conn.execute("""
+                SELECT session_id, plan_id, replan_cycle, constraint_text, satisfied, checked_at
+                FROM constraint_audit
+                ORDER BY checked_at DESC, replan_cycle, id
+                LIMIT 50
+            """)
+        rows = cur.fetchall()
+
+    if not rows:
+        print("No constraint audit records found.")
+        return
+
+    current_session = None
+    for row in rows:
+        session, plan_id, cycle, text, satisfied, checked_at = row
+        if session != current_session:
+            print(f"\n{'='*60}")
+            print(f"Session: {session[:8]}...  Plan: {plan_id[:8]}...")
+            current_session = session
+        status = "+" if satisfied else "X"
+        print(f"  Cycle {cycle} [{status}] {text[:100]}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Inspect AI Intern plan results")
     parser.add_argument("--no-tree", action="store_true", help="Skip tree visualization")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("--constraints", action="store_true",
+                        help="Show constraint audit history (replan cycles + violations)")
+    parser.add_argument("--session", type=str, default=None,
+                        help="Filter constraint audit by session ID prefix")
     args = parser.parse_args()
 
-    inspect_latest_plan(show_tree=not args.no_tree, json_output=args.json)
+    if args.constraints:
+        show_constraint_audit(session_id=args.session)
+    else:
+        inspect_latest_plan(show_tree=not args.no_tree, json_output=args.json)
 
 
 if __name__ == "__main__":

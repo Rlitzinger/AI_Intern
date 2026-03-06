@@ -537,7 +537,10 @@ Example JSON:
                 task_order=i,
                 goal=spec.goal,
                 declared_agent=spec.agent_type,
+                depends_on=spec.depends_on,
             )
+            # Clamp depends_on to valid sibling indices
+            task_obj.depends_on = [d for d in task_obj.depends_on if 0 <= d < len(filtered_specs) and d != i]
             subtasks.append(task_obj)
 
         return subtasks, tokens
@@ -601,6 +604,40 @@ Example JSON:
                 "public_interface": comp.public_interface,
             }
             subtasks.append(subtask)
+
+        # --- Resolve component-name dependencies to task indices ---
+        # Build a lookup: component_name -> task_order (index within this subtask list)
+        name_to_index = {}
+        for i, st in enumerate(subtasks):
+            contract = st.output_contract
+            if isinstance(contract, dict) and "component_name" in contract:
+                name_to_index[contract["component_name"]] = i
+
+        # Now wire up depends_on using the lookup
+        for st in subtasks:
+            contract = st.output_contract
+            if not isinstance(contract, dict):
+                continue
+            comp_name = contract.get("component_name", "")
+            # Find the original ComponentSpec to get its depends_on names
+            matching_comps = [c for c in components if c.name == comp_name]
+            if not matching_comps:
+                continue
+            comp_deps = matching_comps[0].depends_on  # list[str] of component names
+            resolved = []
+            for dep_name in comp_deps:
+                if dep_name in name_to_index:
+                    resolved.append(name_to_index[dep_name])
+                else:
+                    logger.warning(
+                        f"Component '{comp_name}' depends on '{dep_name}' "
+                        f"but no task found for it — dependency dropped"
+                    )
+            if resolved:
+                st.depends_on = sorted(resolved)
+                logger.info(
+                    f"Task {st.task_order} ({comp_name}) depends on tasks {resolved}"
+                )
 
         logger.info(f"Spec-driven decomposition produced {len(subtasks)} subtasks")
         return subtasks, 0  # No LLM call needed — spec already provides the plan

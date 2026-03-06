@@ -54,32 +54,91 @@ class Orchestrator:
         # === STAGE 1.5: RED TEAM COUNCIL ===
         print(f"\nStage 1.5: Red Team Council")
 
-        # session_id persists across re-plan cycles for Historian linking
+        from ..planning.red_team.constraint_verifier import ConstraintVerifier
+        from ..storage import save_constraint_audit
+
         import uuid as _uuid
         council_session_id = str(_uuid.uuid4())
+        MAX_REPLAN_CYCLES = 3  # Hard cap. Prevents infinite loops on stubborn constraints.
 
-        council_verdict, council_tokens = RedTeamCouncil.review(
-            plan, request, cycle=0, session_id=council_session_id
-        )
-        plan.token_usage += council_tokens
-
-        if not council_verdict.approved and council_verdict.constraint_manifest:
-            n = len(council_verdict.high_confidence_findings)
-            print(f"\n   {n} blocking issue(s) -- replanning with constraints...")
-
-            plan = self._replan_with_manifest(request, council_verdict.constraint_manifest)
-            plan.token_usage += council_tokens  # approximate
-
-            council_verdict_2, council_tokens_2 = RedTeamCouncil.review(
-                plan, request, cycle=1, session_id=council_session_id
+        manifest = None
+        for replan_cycle in range(MAX_REPLAN_CYCLES + 1):
+            # First iteration: review the initial plan
+            # Subsequent iterations: review the replanned plan
+            council_verdict, council_tokens = RedTeamCouncil.review(
+                plan, request,
+                cycle=replan_cycle,
+                session_id=council_session_id
             )
-            plan.token_usage += council_tokens_2
+            plan.token_usage += council_tokens
 
-            # Mark whether first-cycle findings survived into second cycle
-            mark_findings_survived(council_session_id, cycle=0, survived=not council_verdict_2.approved)
+            if council_verdict.approved:
+                if replan_cycle > 0:
+                    print(f"   Plan approved after {replan_cycle} replan cycle(s)")
+                    if manifest:
+                        # Verify deterministically even when council approves after replan
+                        # (council can be fooled; verifier cannot)
+                        violations = ConstraintVerifier.check(plan, manifest)
+                        satisfied_count = len(manifest.must_include_tasks) - len(violations)
+                        save_constraint_audit(
+                            council_session_id, plan.plan_id, replan_cycle,
+                            violations, max(satisfied_count, 0)
+                        )
+                        if violations:
+                            print(f"   WARNING: Council approved but {len(violations)} constraint(s) still unmet:")
+                            for v in violations:
+                                print(f"     - {v}")
+                            # Log to storage for inspection but don't block execution
+                            # (we've already replanned; proceeding is better than infinite loop)
+                break
 
-            if not council_verdict_2.approved:
-                print(f"   Issues remain after revision -- proceeding with warnings")
+            # Council rejected the plan
+            if not council_verdict.constraint_manifest:
+                # No manifest means council found issues but couldn't generate constraints
+                print(f"   Council rejected plan (cycle {replan_cycle}) but no manifest generated -- proceeding")
+                break
+
+            manifest = council_verdict.constraint_manifest
+            n = len(council_verdict.high_confidence_findings)
+
+            # Mark whether findings survived from previous cycle
+            if replan_cycle > 0:
+                mark_findings_survived(council_session_id, cycle=replan_cycle - 1, survived=True)
+
+            if replan_cycle >= MAX_REPLAN_CYCLES:
+                # Exhausted replan budget
+                violations = ConstraintVerifier.check(plan, manifest)
+                save_constraint_audit(
+                    council_session_id, plan.plan_id, replan_cycle,
+                    violations, len(manifest.must_include_tasks) - len(violations)
+                )
+                print(f"   Max replan cycles ({MAX_REPLAN_CYCLES}) reached.")
+                print(f"   {len(violations)} constraint(s) remain unmet after {MAX_REPLAN_CYCLES} attempts:")
+                for v in violations:
+                    print(f"     - {v}")
+                print(f"   Proceeding with best available plan.")
+                break
+
+            print(f"\n   Cycle {replan_cycle + 1}/{MAX_REPLAN_CYCLES}: {n} blocking issue(s) -- replanning...")
+
+            # Replan
+            plan = self._replan_with_manifest(request, manifest)
+            plan.token_usage += council_tokens  # approximate carry-forward
+
+            # DETERMINISTIC VERIFICATION: Check before burning another council review
+            violations = ConstraintVerifier.check(plan, manifest)
+            save_constraint_audit(
+                council_session_id, plan.plan_id, replan_cycle,
+                violations, len(manifest.must_include_tasks) - len(violations)
+            )
+            if violations:
+                print(f"   Post-replan verifier: {len(violations)} constraint(s) still unmet after replan:")
+                for v in violations:
+                    print(f"     - {v}")
+                # Don't break -- let council review run. Council may catch different issues.
+                # But this surfaces the problem immediately in the terminal output.
+            else:
+                print(f"   Post-replan verifier: all {len(manifest.must_include_tasks)} required tasks present \u2713")
 
         save_plan_to_sqlite(plan)
         print(f"   Saved plan after council review")
@@ -191,6 +250,19 @@ class Orchestrator:
                 task.goal = task.original_goal
 
             # Build context from previous tasks (#5 - use data_summary when available)
+            # When depends_on is set, only include declared dependencies (focused context).
+            # When depends_on is empty, include all previous tasks (backward compat).
+            if task.depends_on:
+                relevant_tasks = [
+                    t for t in plan.tasks
+                    if t.task_order in task.depends_on and t.result is not None
+                ]
+            else:
+                relevant_tasks = [
+                    t for t in plan.tasks
+                    if t.task_order < task.task_order and t.result is not None
+                ]
+
             context = {
                 'previous_tasks': [
                     {
@@ -214,8 +286,7 @@ class Orchestrator:
                             else None
                         ),
                     }
-                    for t in plan.tasks
-                    if t.task_order < task.task_order and t.result is not None
+                    for t in relevant_tasks
                 ]
             }
 
@@ -555,6 +626,13 @@ class Orchestrator:
         for task in plan.tasks:
             if task.task_order == 0:
                 continue  # First task has no dependencies
+
+            # Respect dependencies already set by the planner (e.g., spec-driven)
+            if task.depends_on:
+                logger.debug(
+                    f"Task {task.task_order} already has depends_on={task.depends_on}, skipping auto-detect"
+                )
+                continue
 
             goal_lower = task.goal.lower()
 

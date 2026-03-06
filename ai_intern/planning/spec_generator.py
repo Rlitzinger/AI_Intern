@@ -96,6 +96,12 @@ class AppSpec(BaseModel):
     done_criteria: list[str]        # How to know the app is complete (2-4 items)
 
 
+# Strict entrypoints: files the council accepts as a real runnable entry point.
+# server.py does NOT qualify — it must be called by something; main.py/app.py do.
+STRICT_ENTRYPOINT_FILENAMES = {"main.py", "app.py"}
+STRICT_ENTRYPOINT_NAMES = {"main", "app", "cli", "runner", "entrypoint"}
+
+
 class SpecGenerator:
     """
     Generates a structured AppSpec from an app-scale request.
@@ -136,6 +142,23 @@ class SpecGenerator:
             print(f"      WARNING: Injecting missing component deterministically...")
             logger.warning(f"capability_owner '{intent.capability_owner}' missing — injecting deterministically")
             spec = cls._inject_capability_component(spec, intent)
+
+        # Safety net: ensure spec includes a runnable entrypoint component
+        # The Integrator red team agent will flag missing_entrypoint and trigger
+        # a replan cycle if this is absent. Inject it here instead.
+        if not cls._spec_has_entrypoint(spec):
+            is_web_app = any(
+                kw in c.lower()
+                for c in intent.constraints
+                for kw in ("web", "server", "http", "flask", "fastapi")
+            ) or any(
+                kw in task.goal.lower()
+                for kw in ("web app", "web application", "http server", "flask", "fastapi")
+            )
+            entrypoint_name = "Server" if is_web_app else "Main"
+            print(f"      [Safety net] Injecting entrypoint ({entrypoint_name})")
+            logger.info(f"[Safety net] No entrypoint detected — injecting {entrypoint_name}")
+            spec = cls._inject_entrypoint(spec, is_web_app)
 
         logger.info(f"Spec generated: {spec.summary}")
         logger.info(f"Components ({len(spec.components)}): {', '.join(c.name for c in spec.components)}")
@@ -267,6 +290,66 @@ that implement it. Component [0] must always be the capability owner named in th
             features=spec.features,
             components=new_components,
             done_criteria=spec.done_criteria
+        )
+
+    @classmethod
+    def _spec_has_entrypoint(cls, spec: AppSpec) -> bool:
+        """
+        Returns True if the spec includes a file the council accepts as a real entrypoint.
+
+        Strict definition: must be main.py or app.py, OR a component named Main/App/CLI/Runner.
+        server.py does NOT qualify — the council expects something that can be run with
+        `python main.py` and contains `if __name__ == '__main__'` semantics.
+        """
+        for c in spec.components:
+            filename = c.output_file.split("/")[-1].lower()
+            if filename in STRICT_ENTRYPOINT_FILENAMES:
+                return True
+            if c.name.lower() in STRICT_ENTRYPOINT_NAMES:
+                return True
+        return False
+
+    @classmethod
+    def _inject_entrypoint(cls, spec: AppSpec, is_web_app: bool) -> AppSpec:
+        """
+        Inject a main.py entrypoint that wires the existing components together.
+        Called only when _spec_has_entrypoint() returns False.
+
+        Always injects main.py (not server.py) — the council specifically looks for
+        main.py / app.py with `if __name__ == '__main__'` semantics.
+        """
+        all_names = [c.name for c in spec.components]
+        # Find the most likely "top-level" component to call from main
+        # Prefer Server > Handler > the last component in the list
+        top_component = next(
+            (c.name for c in spec.components if c.name.lower() in ("server", "handler", "app")),
+            all_names[-1] if all_names else "App",
+        )
+        if is_web_app:
+            responsibility = (
+                f"Entry point — imports {top_component} and starts the HTTP server. "
+                "Contains `if __name__ == '__main__':` block."
+            )
+            interface = f"if __name__ == '__main__': {top_component}().start_server()"
+        else:
+            responsibility = (
+                "Entry point — parses CLI arguments and starts the application. "
+                "Contains `if __name__ == '__main__':` block."
+            )
+            interface = "main() — `if __name__ == '__main__': main()`"
+
+        entrypoint = ComponentSpec(
+            name="Main",
+            responsibility=responsibility,
+            output_file="outputs/main.py",
+            depends_on=all_names,
+            public_interface=interface,
+        )
+        return AppSpec(
+            summary=spec.summary,
+            features=spec.features,
+            components=list(spec.components) + [entrypoint],
+            done_criteria=spec.done_criteria,
         )
 
     @staticmethod

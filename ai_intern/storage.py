@@ -73,6 +73,45 @@ def mark_findings_survived(session_id: str, cycle: int, survived: bool):
         """, (1 if survived else 0, session_id, cycle))
 
 
+def ensure_constraint_audit_table(conn: sqlite3.Connection):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS constraint_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            plan_id TEXT NOT NULL,
+            replan_cycle INTEGER NOT NULL,
+            constraint_text TEXT NOT NULL,
+            satisfied INTEGER NOT NULL DEFAULT 0,
+            checked_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+
+
+def save_constraint_audit(
+    session_id: str,
+    plan_id: str,
+    replan_cycle: int,
+    violations: list[str],
+    satisfied_count: int,
+):
+    """Record the constraint verification result for this replan cycle."""
+    with get_db_connection() as conn:
+        ensure_constraint_audit_table(conn)
+        for violation in violations:
+            conn.execute("""
+                INSERT INTO constraint_audit
+                    (session_id, plan_id, replan_cycle, constraint_text, satisfied)
+                VALUES (?, ?, ?, ?, 0)
+            """, (session_id, plan_id, replan_cycle, violation))
+        # Record satisfied count as a summary row
+        if satisfied_count > 0:
+            conn.execute("""
+                INSERT INTO constraint_audit
+                    (session_id, plan_id, replan_cycle, constraint_text, satisfied)
+                VALUES (?, ?, ?, ?, 1)
+            """, (session_id, plan_id, replan_cycle, f"[{satisfied_count} constraints satisfied]"))
+
+
 def save_plan_to_sqlite(plan: PlanSchema):
     """Save plan to database using context manager for safety."""
     try:

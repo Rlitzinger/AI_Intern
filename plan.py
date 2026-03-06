@@ -529,6 +529,58 @@ else:
           f"block threshold: {n_block}")
     print(f"  Tokens      : {council_tokens:,}")
 
+    # -----------------------------------------------------------------
+    # REPLAN LOOP (hardened — deterministic constraint verification)
+    # Mirrors the Stage 1.5 loop in orchestrator.py.
+    # -----------------------------------------------------------------
+    if not council_verdict.approved and council_verdict.constraint_manifest:
+        from ai_intern.planning.red_team.constraint_verifier import ConstraintVerifier
+        from ai_intern.orchestration.orchestrator import Orchestrator
+
+        _orch = Orchestrator()
+        manifest = council_verdict.constraint_manifest
+        MAX_REPLAN_CYCLES = 3
+
+        print()
+        for replan_cycle in range(1, MAX_REPLAN_CYCLES + 1):
+            n_issues = len(council_verdict.high_confidence_findings)
+            print(f"   Cycle {replan_cycle}/{MAX_REPLAN_CYCLES}: {n_issues} blocking issue(s) -- replanning...")
+
+            plan = _orch._replan_with_manifest(req, manifest)
+
+            # Deterministic check before burning another council review
+            violations = ConstraintVerifier.check(plan, manifest)
+            if violations:
+                print(f"   Post-replan verifier: {len(violations)} constraint(s) still unmet after replan:")
+                for v in violations:
+                    print(f"     - {v}")
+            else:
+                print(f"   Post-replan verifier: all {len(manifest.must_include_tasks)} required tasks present \u2713")
+
+            # Second council review
+            _stdout_buf_r = _io.StringIO()
+            sys.stdout = _stdout_buf_r
+            council_verdict2, council_tokens2 = RedTeamCouncil.review(plan, req, cycle=replan_cycle)
+            sys.stdout = _real_stdout
+            plan.token_usage += council_tokens2
+
+            if council_verdict2.approved:
+                print(f"   Plan approved after {replan_cycle} replan cycle(s)")
+                break
+
+            # Still rejected
+            council_verdict = council_verdict2
+            if council_verdict2.constraint_manifest:
+                manifest = council_verdict2.constraint_manifest
+
+            if replan_cycle >= MAX_REPLAN_CYCLES:
+                final_violations = ConstraintVerifier.check(plan, manifest)
+                print(f"   Max replan cycles ({MAX_REPLAN_CYCLES}) reached.")
+                print(f"   {len(final_violations)} constraint(s) remain unmet:")
+                for v in final_violations:
+                    print(f"     - {v}")
+                print(f"   Proceeding with best available plan.")
+
 
 # -----------------------------------------------------------------------
 # FINAL PLAN SUMMARY

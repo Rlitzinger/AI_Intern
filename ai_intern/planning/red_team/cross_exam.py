@@ -9,12 +9,23 @@ class CrossExamination:
     temperature = 0.1
 
     SYSTEM = """You are reviewing adversarial findings about a plan.
-Filter noise from signal.
-CONFIRM only with INDEPENDENT evidence -- not just agreement.
-DISPUTE only if you can show the finding misreads the plan specifically.
-EXTEND only if the finding reveals a deeper problem not yet surfaced.
-Do not be agreeable. False confirmations are worse than missed issues.
-Respond to every finding NOT from your own agent."""
+Your job: filter noise from signal with epistemic rigor.
+
+CONFIRM: Only if you have INDEPENDENT evidence not already stated in the finding.
+  - Independent means: you observed it yourself by reading the plan, not by agreeing with the finding's reasoning.
+  - If your reasoning would be: "Yes, the finding is correct because [restatement of finding]" -> that is NOT confirm, that is noise.
+  - If your reasoning would be: "I also see [specific plan detail not mentioned in the finding]..." -> that IS confirm.
+
+DISPUTE: If you can show the finding misreads the plan specifically.
+  - Cite the exact plan line/task/contract that contradicts the finding.
+  - "I think it's fine" is not a dispute.
+
+EXTEND: If the finding is correct AND implies a deeper problem not yet surfaced.
+  - State the deeper problem explicitly.
+
+Abstain from responding to a finding if you have nothing independent to add.
+False confirmations inflate confidence scores and cause unnecessary replanning.
+Default to DISPUTE when uncertain -- the Blue Team will catch real issues."""
 
     @classmethod
     def run(
@@ -55,7 +66,7 @@ For each finding above, respond with:
 - reasoning: specific reason referencing the plan
 - additional_evidence: your own evidence (empty string if disputing)
 
-CONFIRM = you have independent evidence for the same issue
+CONFIRM = you have NEW evidence NOT already stated in the finding (do not restate the finding)
 DISPUTE = you can show the finding misreads the plan
 EXTEND  = finding is correct AND implies a deeper problem
 

@@ -115,10 +115,18 @@
 - structure retry prmpting with category-aware correction prompts
 - kv cache values passed to coding agent
 
+# 3/3/2026
+- pain in the ass day. moved away from ollama to llama.cpp and outlines
+- with the new packages i can have more fine tuned control over the llm
+- can used constrained decoding and use outlines to pass strict syntax in the llm
+- honestly the hardest part so far was this. just getting the system in check
+
 # 3/4/2025
 - did a lot more work on the planner
+- added in constrained decoding for planning output to pick specific agents to use
 - added a better classification of the planner
 - provided context to the planner on what agents are available
 - made a clear part of the plan to focus on exact user reqs (we were just making the same CRUD app without specifics over and over)
 - added a critiqueagent and output contract
 - updated the plan.py to better show details of what happened during the planning phase, and the thinking/reasoning
+- added a round of critique with a red team/blue team

@@ -1,1124 +1,541 @@
-# ACTIVE TASK: Replace CritiqueAgent with Adversarial Red Team Council
+# ACTIVE.md — Wire Spec-Driven Dependencies Into the Task Graph
 
-## Overview
+## Objective
+Convert spec-driven component dependencies from prose hints embedded in goal strings
+into machine-readable `task.depends_on` edges, and ensure the orchestrator's
+`_auto_detect_dependencies` doesn't overwrite them. Four changes, ordered by
+dependency (each builds on the previous).
 
-Replace the single `CritiqueAgent` with a multi-round adversarial council.
-The current critique reads the plan and reports issues — literary criticism.
-The new system simulates execution, debates findings, forces the planner to defend
-its own work, then produces a confidence-scored constraint manifest for revision.
-
-Also: add `plan_critique_history` SQLite table for the Historian agent (tomorrow).
-
----
-
-## Architecture: 5-Round Adversarial Council
-
-```
-Plan
- |
- |-- Round 1: Independent Red Team (3 sequential LLM calls, logically parallel)
- |     |-- ExecutorAgent    -- traces data flow task-by-task
- |     |-- IntegratorAgent  -- reasons about artifact graph
- |     +-- MinimalistAgent  -- counterfactual simplicity check
- |
- |-- Round 2: Cross-Examination (3 sequential LLM calls)
- |     Each agent reviews ALL findings NOT from itself (global indices preserved)
- |     Responds: CONFIRM / DISPUTE / EXTEND per finding
- |
- |-- Round 3: Blue Team Defense (1 LLM call)
- |     Planner defends plan against surviving findings
- |     Prompted as skeptical self-critic, not advocate
- |
- |-- Round 4: Synthesis (deterministic, zero LLM cost)
- |     Confidence score per finding. Severity-gated:
- |       warn findings capped at 0.60 (below BLOCK_THRESHOLD)
- |       block findings can reach 1.0
- |     Only block-severity findings above 0.65 trigger revision
- |
- +-- Round 5: Constraint Manifest + Re-plan (conditional, max 2 cycles)
-       ConstraintManifest injected as hard rules into re-planner
-       session_id links original and re-planned runs for Historian
-```
+**Time budget:** ~45 minutes of Claude Code execution.
 
 ---
 
-## Files to Create
+## Context for Claude Code
 
-```
-ai_intern/planning/red_team/
-|-- __init__.py          (exports RedTeamCouncil)
-|-- utils.py             (shared _format_plan, _format_artifacts)
-|-- executor.py          (ExecutorAgent)
-|-- integrator.py        (IntegratorAgent)
-|-- minimalist.py        (MinimalistAgent)
-|-- cross_exam.py        (CrossExamination)
-|-- blue_team.py         (BlueTeamDefense)
-|-- synthesis.py         (compute_confidence, build_constraint_manifest)
-+-- council.py           (RedTeamCouncil -- top-level orchestrator)
-```
+### What this system does
+This is a local LLM multi-agent pipeline. Requests flow through:
+`Orchestrator → HierarchicalPlanner → TaskRouter → Agent (Coding/Research/File) → Validator`
 
-## Files to Modify
+For app-scale requests (multi-file apps), the planner runs a `SpecGenerator` that
+produces an `AppSpec` with `ComponentSpec` objects. Each `ComponentSpec` has a
+`depends_on: list[str]` field listing the *names* of other components it imports.
 
-- `ai_intern/schemas.py` -- add new schemas (RedTeamFinding, etc.)
-- `ai_intern/storage.py` -- add critique history table + helpers
-- `ai_intern/orchestration/orchestrator.py` -- swap CritiqueAgent for RedTeamCouncil
-- `ai_intern/planning/__init__.py` -- export RedTeamCouncil
-- `plan.py` -- update Stage 1.5 display
+The method `_decompose_task_from_spec` in `hierarchical.py` converts each
+`ComponentSpec` into a `TaskSchema`. **The bug:** it encodes `comp.depends_on` as
+prose in the goal string (`"Imports from: ColorExtractor (already implemented)"`) but
+never populates `task.depends_on: list[int]`.
+
+### What already works (do NOT reimplement)
+- `TaskSchema.depends_on: list[int]` field exists (`schemas.py:87`)
+- Execution skip logic in `orchestrator.py:124-134` already checks `task.depends_on`
+  and skips tasks whose dependencies failed
+- `SubtaskSpec.depends_on: list[int]` exists (`schemas.py:50`) and the standard
+  decomposition prompt already asks the LLM to populate it
+- `ProjectWorkspace` already resolves imports from component names
+- The `output_contract` dict on spec-driven tasks already carries `component_name`
+
+### Key file locations (absolute paths)
+All source files are in the project root. Key files for this change:
+
+| File | Role |
+|---|---|
+| `hierarchical.py` | `_decompose_task_from_spec` (Change 1), `_decompose_task` standard path (Change 3) |
+| `orchestrator.py` | `_auto_detect_dependencies` (Change 2), execution loop context building (Change 4) |
+| `schemas.py` | `TaskSchema`, `SubtaskSpec`, `ComponentSpec` — read-only for this change |
+| `spec_generator.py` | `AppSpec`, `ComponentSpec` — read-only for this change |
+| `workspace.py` | `ProjectWorkspace` — read-only for this change |
 
 ---
 
-## Pre-flight Check (do this first)
+## Implementation Order
 
-Before writing any new code, verify that `TaskSchema` in `ai_intern/schemas.py` has
-these fields. If any are missing, add them with appropriate defaults before proceeding:
+### Change 1: Map `comp.depends_on` to `task.depends_on` in `_decompose_task_from_spec`
 
+**File:** `hierarchical.py`, method `_decompose_task_from_spec` (starts ~line 561)
+
+**Current behavior (the bug):**
 ```python
-declared_agent: Optional[str] = None      # agent explicitly declared by decomposer
-suggested_agent: Optional[str] = None     # agent inferred by heuristic
-original_goal: Optional[str] = None       # goal before retry feedback appended
-output_contract: Optional[Any] = None     # OutputContract or dict (spec-driven)
-error_history: list[dict] = Field(default_factory=list)
-```
-
-These are referenced by `_format_plan()` in utils.py and by existing orchestrator code.
-If they already exist (likely — they're used in the uploaded orchestrator.py), skip this.
-
----
-
-## Detailed Implementation
-
----
-
-### 1. New Pydantic Schemas  (add to `ai_intern/schemas.py`)
-
-```python
-from typing import Literal, Optional
-
-class RedTeamFinding(BaseModel):
-    """A single finding from one red team agent."""
-    # NOTE: agent is NOT in the LLM schema -- set server-side after the call.
-    # It is Optional here so Pydantic doesn't reject LLM output that omits it.
-    agent: Optional[str] = None
-    task_index: int = -1      # -1 = plan-level finding, not task-specific
-    finding_type: str         # see per-agent prompt for valid values
-    description: str
-    evidence: str
-    severity: Literal["block", "warn"]
-    # Original index in all_r1_findings -- set by council, not LLM
-    original_index: Optional[int] = None
-
-class FindingsResult(BaseModel):
-    """Wrapper schema for LLM findings response."""
-    findings: list[RedTeamFinding]
-
-class CrossExamResponse(BaseModel):
-    """One agent's response to a finding (references global finding index)."""
-    finding_index: int        # Index into all_r1_findings (global, not local)
-    verdict: Literal["confirm", "dispute", "extend"]
-    reasoning: str
-    additional_evidence: str = ""
-
-class CrossExamResult(BaseModel):
-    responses: list[CrossExamResponse]
-
-class BlueTeamResponse(BaseModel):
-    """Planner's rebuttal attempt. finding_index refs all_r1_findings."""
-    finding_index: int        # Index into all_r1_findings (global)
-    can_rebut: bool
-    rebuttal: str = ""
-
-class BlueTeamResult(BaseModel):
-    responses: list[BlueTeamResponse]
-
-class ConstraintManifest(BaseModel):
-    """Structured re-planning constraints. NOT freeform text."""
-    task_constraints: dict[int, str]     # task_index -> constraint string
-    structural_constraints: list[str]
-    must_include_tasks: list[str]
-    must_not_combine: list[list[str]]    # list[list[str]] not list[tuple] -- JSON compat
-
-class CouncilVerdict(BaseModel):
-    """Final output of the Red Team Council."""
-    approved: bool
-    confidence_scores: dict[int, float]        # finding original_index -> score
-    high_confidence_findings: list[RedTeamFinding]
-    constraint_manifest: Optional[ConstraintManifest] = None
-    rounds_used: int
-    total_tokens: int
-    session_id: str                            # links original + re-plan cycles
-    all_findings: list[RedTeamFinding]         # all R1 findings with original_index set
-    cross_exam_responses: list[CrossExamResponse]
-    blue_team_responses: list[BlueTeamResponse]
-```
-
----
-
-### 2. SQLite Changes  (`ai_intern/storage.py`)
-
-Add to existing `save_plan_to_sqlite`, call `ensure_critique_history_table(conn)`
-before the plan INSERT so the table always exists.
-
-```python
-def ensure_critique_history_table(conn: sqlite3.Connection):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS plan_critique_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,    -- links original plan + re-plan cycles
-            plan_id TEXT NOT NULL,
-            request_content TEXT,
-            cycle INTEGER NOT NULL DEFAULT 0,
-            round TEXT NOT NULL,         -- executor|integrator|minimalist|cross_exam|blue_team|synthesis
-            agent TEXT NOT NULL,
-            finding_type TEXT,
-            task_index INTEGER,
-            severity TEXT,
-            content TEXT NOT NULL,
-            confidence_score REAL,
-            verdict TEXT,                -- confirm|dispute|extend|rebut|concede|null
-            survived_revision INTEGER DEFAULT NULL,  -- 1=yes 0=no null=unknown
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """)
-
-def save_critique_event(
-    session_id: str,
-    plan_id: str,
-    request_content: str,
-    cycle: int,
-    round_name: str,
-    agent: str,
-    content: str,
-    finding_type: str = None,
-    task_index: int = None,
-    severity: str = None,
-    confidence_score: float = None,
-    verdict: str = None,
-):
-    with get_db_connection() as conn:
-        ensure_critique_history_table(conn)
-        conn.execute("""
-            INSERT INTO plan_critique_history
-                (session_id, plan_id, request_content, cycle, round, agent,
-                 finding_type, task_index, severity, content, confidence_score, verdict)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            session_id, plan_id, request_content, cycle, round_name, agent,
-            finding_type, task_index, severity, content, confidence_score, verdict
-        ))
-
-def mark_findings_survived(session_id: str, cycle: int, survived: bool):
-    """Mark whether findings from this cycle persisted into the next."""
-    with get_db_connection() as conn:
-        conn.execute("""
-            UPDATE plan_critique_history
-            SET survived_revision = ?
-            WHERE session_id = ? AND cycle = ?
-        """, (1 if survived else 0, session_id, cycle))
-```
-
-Also call `ensure_critique_history_table(conn)` inside `save_plan_to_sqlite`
-before the existing INSERT so the table is created on first run automatically.
-
----
-
-### 3. Shared Utilities  (`red_team/utils.py`)
-
-Both executor and integrator need these. Keep them here, import from everywhere.
-
-```python
-from ...schemas import PlanSchema
-
-def format_plan_for_prompt(plan: PlanSchema) -> str:
-    """Format all tasks with agent, goal, and contract for LLM prompts."""
-    lines = []
-    for t in plan.tasks:
-        agent = t.declared_agent or t.suggested_agent or "unknown"
-        lines.append(f"Task {t.task_order} [{agent}]: {t.goal[:120]}")
-        if isinstance(t.output_contract, dict):
-            lines.append(f"  output_file : {t.output_contract.get('output_file', 'none')}")
-            lines.append(f"  interface   : {t.output_contract.get('public_interface', 'none')}")
-            deps = t.output_contract.get("depends_on", [])
-            if deps:
-                lines.append(f"  depends_on  : {deps}")
-        elif t.output_contract is not None:
-            oc = t.output_contract
-            lines.append(f"  output_type : {oc.output_type}")
-            lines.append(f"  output_format: {oc.output_format}")
-            lines.append(f"  consumed_by : {oc.required_by_tasks}")
-    return "\n".join(lines)
-
-def format_artifacts_for_prompt(plan: PlanSchema) -> str:
-    """Format only spec-driven artifacts (component files + interfaces)."""
-    lines = []
-    for t in plan.tasks:
-        if isinstance(t.output_contract, dict):
-            name = t.output_contract.get("component_name", "?")
-            file = t.output_contract.get("output_file", "?")
-            iface = t.output_contract.get("public_interface", "?")
-            deps = t.output_contract.get("depends_on", [])
-            line = f"{file}  ({name}): {iface}"
-            if deps:
-                line += f"  -- imports: {deps}"
-            lines.append(line)
-    if not lines:
-        return "(No spec-driven artifacts -- non-app-scale plan)"
-    return "\n".join(lines)
-```
-
----
-
-### 4. ExecutorAgent  (`red_team/executor.py`)
-
-```python
-from ...schemas import PlanSchema, FindingsResult, RedTeamFinding
-from ...llm import call_ollama_structured
-from ...config import settings
-from .utils import format_plan_for_prompt
-
-class ExecutorAgent:
-    model = settings.PLANNING_MODEL
-    temperature = 0.1
-
-    SYSTEM = """You are an adversarial execution simulator.
-ONE job: find data flow failures. Not validate success.
-Trace each task in order. For each task, check whether its inputs
-exist based on what prior tasks actually produce.
-Be specific. Cite exact task indices.
-If no issues exist, return empty findings list."""
-
-    @classmethod
-    def find_issues(cls, plan: PlanSchema) -> tuple[list[RedTeamFinding], int]:
-        task_repr = format_plan_for_prompt(plan)
-
-        prompt = f"""Plan to simulate (trace in order 0..{len(plan.tasks)-1}):
-
-{task_repr}
-
-For each task, answer:
-1. What does this task NEED from context to execute?
-2. What did all PRIOR tasks actually produce (check their output contracts)?
-3. Is there a mismatch?
-
-Also check:
-- Does any task reference a file or class no prior task wrote?
-- Does any task produce output no later task consumes (orphaned)?
-- Is any task assigned the wrong agent type for what it does?
-
-finding_type must be one of:
-  context_mismatch | missing_input | orphaned_output | wrong_agent | missing_file
-
-severity:
-  block = execution would fail here
-  warn  = execution degrades but continues
-
-DO NOT populate the "agent" field -- leave it null.
-Return JSON: {{"findings": [{{"task_index": int, "finding_type": str,
-  "description": str, "evidence": str, "severity": str}}]}}
-Return {{"findings": []}} if no issues found."""
-
-        result, tokens = call_ollama_structured(
-            model=cls.model, prompt=prompt, system=cls.SYSTEM,
-            response_schema=FindingsResult, temperature=cls.temperature
-        )
-        for f in result.findings:
-            f.agent = "executor"
-        return result.findings, tokens
-```
-
----
-
-### 5. IntegratorAgent  (`red_team/integrator.py`)
-
-```python
-from ...schemas import PlanSchema, FindingsResult, RedTeamFinding
-from ...llm import call_ollama_structured
-from ...config import settings
-from .utils import format_artifacts_for_prompt
-
-class IntegratorAgent:
-    model = settings.PLANNING_MODEL
-    temperature = 0.1
-
-    SYSTEM = """You are an adversarial integration reviewer.
-Ignore how each task works internally.
-Only look at the full artifact set: what files are produced, what each imports,
-whether the artifact set forms a runnable application.
-If no integration issues exist, return empty findings."""
-
-    @classmethod
-    def find_issues(cls, plan: PlanSchema) -> tuple[list[RedTeamFinding], int]:
-        artifact_repr = format_artifacts_for_prompt(plan)
-
-        prompt = f"""Artifacts this plan produces:
-
-{artifact_repr}
-
-Analyze the full artifact set ONLY (not individual tasks):
-1. Is there an entrypoint? (a file runnable with `python X`)
-2. Does each import chain resolve? (if A imports B, does B exist?)
-3. Are there import cycles? (A imports B imports A)
-4. Dead components? (produced but nothing imports them, no entrypoint)
-5. Is the artifact set complete? (can a user actually run this?)
-
-finding_type must be one of:
-  missing_entrypoint | import_cycle | broken_dependency | dead_component | incomplete_artifact_set
-
-severity:
-  block = app cannot start
-  warn  = app starts but missing functionality
-
-DO NOT populate the "agent" field -- leave it null.
-Return JSON: {{"findings": [{{"task_index": -1, "finding_type": str,
-  "description": str, "evidence": str, "severity": str}}]}}
-Return {{"findings": []}} if no issues."""
-
-        result, tokens = call_ollama_structured(
-            model=cls.model, prompt=prompt, system=cls.SYSTEM,
-            response_schema=FindingsResult, temperature=cls.temperature
-        )
-        for f in result.findings:
-            f.agent = "integrator"
-        return result.findings, tokens
-```
-
----
-
-### 6. MinimalistAgent  (`red_team/minimalist.py`)
-
-```python
-from ...schemas import PlanSchema, FindingsResult, RedTeamFinding
-from ...llm import call_ollama_structured
-from ...config import settings
-from .utils import format_plan_for_prompt
-
-class MinimalistAgent:
-    model = settings.PLANNING_MODEL
-    temperature = 0.1   # Keep at 0.1 -- handle counterfactual via prompt, not temp
-
-    SYSTEM = """You are an adversarial simplicity reviewer.
-ONE job: find over-engineering.
-Ask: what is the absolute minimum to fulfill this request?
-Compare that minimum to the actual plan.
-Flag every task beyond the minimum viable implementation.
-If the plan is appropriately scoped, return empty findings."""
-
-    @classmethod
-    def find_issues(cls, plan: PlanSchema) -> tuple[list[RedTeamFinding], int]:
-        original_request = ""
-        if plan.tasks:
-            original_request = plan.tasks[0].original_goal or plan.tasks[0].goal
-
-        task_repr = format_plan_for_prompt(plan)
-
-        prompt = f"""Original request: "{original_request}"
-
-Actual plan ({len(plan.tasks)} tasks):
-{task_repr}
-
-Step 1: In ONE sentence, state the minimum viable implementation of this request.
-How many tasks/files does the minimum require?
-
-Step 2: Compare your minimum to the actual plan.
-Is any task unnecessary? Any abstraction that adds no value?
-Is the plan decomposed at the wrong granularity (e.g. 4 files where 1 script works)?
-
-finding_type must be one of:
-  over_engineered | unnecessary_task | premature_abstraction | wrong_scale
-
-severity:
-  block = decomposition makes the request harder to fulfill, not easier
-  warn  = extra complexity but plan would still work
-
-Use task_index = -1 for plan-level findings.
-DO NOT populate the "agent" field -- leave it null.
-Return JSON: {{"findings": [{{"task_index": int, "finding_type": str,
-  "description": str, "evidence": str, "severity": str}}]}}
-Return {{"findings": []}} if plan matches minimum viable."""
-
-        result, tokens = call_ollama_structured(
-            model=cls.model, prompt=prompt, system=cls.SYSTEM,
-            response_schema=FindingsResult, temperature=cls.temperature
-        )
-        for f in result.findings:
-            f.agent = "minimalist"
-        return result.findings, tokens
-```
-
----
-
-### 7. Cross-Examination  (`red_team/cross_exam.py`)
-
-CRITICAL: All three agents review the SAME global finding list with SAME indices.
-Each is filtered to "findings not from your own agent" in the prompt, not in code.
-This ensures finding_index in all responses refers to the same global list.
-
-```python
-from ...schemas import PlanSchema, RedTeamFinding, CrossExamResult
-from ...llm import call_ollama_structured
-from ...config import settings
-from .utils import format_plan_for_prompt
-
-class CrossExamination:
-    model = settings.PLANNING_MODEL
-    temperature = 0.1
-
-    SYSTEM = """You are reviewing adversarial findings about a plan.
-Filter noise from signal.
-CONFIRM only with INDEPENDENT evidence -- not just agreement.
-DISPUTE only if you can show the finding misreads the plan specifically.
-EXTEND only if the finding reveals a deeper problem not yet surfaced.
-Do not be agreeable. False confirmations are worse than missed issues.
-Respond to every finding NOT from your own agent."""
-
-    @classmethod
-    def run(
-        cls,
-        reviewing_agent: str,
-        all_findings: list[RedTeamFinding],   # global list, all agents
-        plan: PlanSchema,
-    ) -> tuple[list[CrossExamResponse], int]:
-        # Filter to findings from other agents -- but preserve original indices
-        other_findings = [
-            (i, f) for i, f in enumerate(all_findings)
-            if f.agent != reviewing_agent
-        ]
-
-        if not other_findings:
-            return [], 0
-
-        # Build findings repr with GLOBAL indices
-        findings_repr = "\n".join(
-            f"[{i}] ({f.agent}/{f.finding_type}) Task {f.task_index}: {f.description}\n"
-            f"    Evidence: {f.evidence}"
-            for i, f in other_findings
-        )
-
-        task_repr = format_plan_for_prompt(plan)
-
-        prompt = f"""You are the {reviewing_agent} agent.
-
-The plan:
-{task_repr}
-
-Findings from OTHER agents to review (indices are GLOBAL -- use them as-is):
-{findings_repr}
-
-For each finding above, respond with:
-- finding_index: the GLOBAL index shown in brackets above (e.g. [2] -> finding_index: 2)
-- verdict: "confirm" | "dispute" | "extend"
-- reasoning: specific reason referencing the plan
-- additional_evidence: your own evidence (empty string if disputing)
-
-CONFIRM = you have independent evidence for the same issue
-DISPUTE = you can show the finding misreads the plan
-EXTEND  = finding is correct AND implies a deeper problem
-
-You must respond to all {len(other_findings)} findings listed above.
-Return JSON: {{"responses": [list of CrossExamResponse objects]}}"""
-
-        result, tokens = call_ollama_structured(
-            model=cls.model, prompt=prompt, system=cls.SYSTEM,
-            response_schema=CrossExamResult, temperature=cls.temperature
-        )
-        return result.responses, tokens
-```
-
----
-
-### 8. Blue Team Defense  (`red_team/blue_team.py`)
-
-finding_index here also references all_r1_findings global indices.
-Only surviving findings are passed in the prompt, but their indices are preserved.
-
-```python
-from ...schemas import PlanSchema, RequestSchema, RedTeamFinding, BlueTeamResult
-from ...llm import call_ollama_structured
-from ...config import settings
-from .utils import format_plan_for_prompt
-
-class BlueTeamDefense:
-    model = settings.PLANNING_MODEL
-    temperature = 0.1
-
-    SYSTEM = """You are the architect who designed this plan.
-Your job: find the weakest points in the adversarial findings.
-Where are they wrong? Where are they right?
-If a finding is correct, admit it -- set can_rebut=false.
-Only set can_rebut=true if you have a specific factual reason it is wrong.
-Be honest. Correctness over winning."""
-
-    @classmethod
-    def run(
-        cls,
-        plan: PlanSchema,
-        request: RequestSchema,
-        surviving_findings: list[RedTeamFinding],  # original_index already set
-    ) -> tuple[list[BlueTeamResponse], int]:
-        if not surviving_findings:
-            return [], 0
-
-        task_repr = format_plan_for_prompt(plan)
-
-        # Use original_index in display so responses reference global indices
-        findings_repr = "\n".join(
-            f"[{f.original_index}] ({f.agent}/{f.finding_type}) Task {f.task_index}: {f.description}\n"
-            f"    Evidence: {f.evidence}"
-            for f in surviving_findings
-        )
-
-        prompt = f"""Original request: "{request.content}"
-
-Your plan:
-{task_repr}
-
-Adversarial findings (indices are GLOBAL -- use them as-is in your responses):
-{findings_repr}
-
-For each finding, respond with:
-- finding_index: the GLOBAL index in brackets above
-- can_rebut: true if the finding is wrong, false if correct
-- rebuttal: your specific argument (empty string if can_rebut=false)
-
-Return JSON: {{"responses": [list of BlueTeamResponse objects]}}"""
-
-        result, tokens = call_ollama_structured(
-            model=cls.model, prompt=prompt, system=cls.SYSTEM,
-            response_schema=BlueTeamResult, temperature=cls.temperature
-        )
-        return result.responses, tokens
-```
-
----
-
-### 9. Synthesis  (`red_team/synthesis.py`)
-
-Deterministic. No LLM. Severity-gated scoring.
-
-```python
-from ...schemas import RedTeamFinding, CrossExamResponse, BlueTeamResponse, ConstraintManifest, PlanSchema
-
-BLOCK_THRESHOLD = 0.65   # High-confidence block finding -> triggers revision
-WARN_SCORE_CAP  = 0.60   # warn findings CANNOT exceed this (below BLOCK_THRESHOLD)
-NOISE_THRESHOLD = 0.25   # Below this: ignore completely
-
-def compute_confidence(
-    finding: RedTeamFinding,                  # has original_index set
-    all_r1_findings: list[RedTeamFinding],    # full R1 list
-    cross_responses: list[CrossExamResponse], # all reference global indices
-    blue_responses: list[BlueTeamResponse],   # all reference global indices
-) -> float:
-    """
-    Score a finding 0.0-1.0 based on round survival.
-    warn findings are capped at WARN_SCORE_CAP (0.60) -- below BLOCK_THRESHOLD.
-
-    Score breakdown:
-      Base (found in R1):                  0.20
-      Same type+task_index in other agents: +0.10 each (max +0.20)
-      Confirmed in cross-exam (>=1):       +0.25
-      Not disputed at all:                 +0.10
-      Blue team failed to rebut:           +0.25
-    """
-    idx = finding.original_index
-    score = 0.20
-
-    # Similar findings from other agents (same finding_type + task_index)
-    similar = sum(
-        1 for f in all_r1_findings
-        if f.original_index != idx
-        and f.finding_type == finding.finding_type
-        and f.task_index == finding.task_index
+for comp in components:
+    goal = (
+        f"Write `{comp.output_file}` Python module.\n"
+        f"Module name / class: {comp.name}\n"
+        f"Public interface (exact signatures): {comp.public_interface}\n"
+        f"Single responsibility: {comp.responsibility}"
     )
-    score += min(similar * 0.10, 0.20)
-
-    # Cross-examination results (by global original_index)
-    relevant_cross = [r for r in cross_responses if r.finding_index == idx]
-    confirms = sum(1 for r in relevant_cross if r.verdict == "confirm")
-    disputes = sum(1 for r in relevant_cross if r.verdict == "dispute")
-
-    if confirms >= 1:
-        score += 0.25
-    if disputes == 0:
-        score += 0.10
-
-    # Blue team (by global original_index)
-    relevant_blue = [r for r in blue_responses if r.finding_index == idx]
-    if relevant_blue and not relevant_blue[0].can_rebut:
-        score += 0.25
-
-    raw = min(score, 1.0)
-
-    # Severity gate: warn findings cannot trigger re-plan
-    if finding.severity == "warn":
-        return min(raw, WARN_SCORE_CAP)
-    return raw
-
-
-def build_constraint_manifest(
-    high_confidence_findings: list[RedTeamFinding],
-    plan: PlanSchema,
-) -> ConstraintManifest:
-    """Convert high-confidence findings into structured re-planning constraints."""
-    task_constraints: dict[int, str] = {}
-    structural_constraints: list[str] = []
-    must_include_tasks: list[str] = []
-    must_not_combine: list[list[str]] = []
-
-    for f in high_confidence_findings:
-        constraint = f"[{f.finding_type}] {f.description}"
-        if f.task_index >= 0:
-            existing = task_constraints.get(f.task_index, "")
-            task_constraints[f.task_index] = (existing + "; " + constraint).lstrip("; ")
-        else:
-            structural_constraints.append(constraint)
-
-        if f.finding_type == "missing_entrypoint":
-            must_include_tasks.append(
-                "A task that writes a runnable entrypoint (main.py or app.py) "
-                "that imports and starts the application"
-            )
-        if f.finding_type == "wrong_agent" and f.task_index >= 0:
-            if f.task_index < len(plan.tasks):
-                task = plan.tasks[f.task_index]
-                agent = task.declared_agent or task.suggested_agent
-                if agent == "code":
-                    combo = ["file", "code"]
-                    if combo not in must_not_combine:
-                        must_not_combine.append(combo)
-
-    return ConstraintManifest(
-        task_constraints=task_constraints,
-        structural_constraints=structural_constraints,
-        must_include_tasks=must_include_tasks,
-        must_not_combine=must_not_combine,
+    if comp.depends_on:
+        goal += f"\nImports from: {', '.join(comp.depends_on)} (already implemented)"
+    subtask = TaskSchema(
+        plan_id=task.plan_id,
+        task_order=len(subtasks),
+        goal=goal,
+        suggested_agent="code",
     )
+    # ... output_contract dict is set, but depends_on is never set
+    subtasks.append(subtask)
 ```
 
----
+`comp.depends_on` contains *component names* (e.g., `["NoteStorage"]`).
+`task.depends_on` expects *task indices* (e.g., `[0]`).
 
-### 10. Council Orchestrator  (`red_team/council.py`)
+**Required change:**
+After building all subtasks, do a second pass that resolves component names to task
+indices using the `output_contract["component_name"]` that was just set on each subtask.
 
-Global index discipline: `original_index` is set on every finding immediately after R1.
-All subsequent rounds use `original_index` for reference -- never re-index.
-`session_id` is generated once and passed through both review cycles for Historian linking.
+**Exact implementation:**
+
+After the existing `for comp in components:` loop (after all subtasks are appended),
+and *before* the `logger.info(f"Spec-driven decomposition produced...")` line, add:
 
 ```python
-import uuid
-from ...schemas import (
-    PlanSchema, RequestSchema, RedTeamFinding,
-    CouncilVerdict, ConstraintManifest
+        # --- Resolve component-name dependencies to task indices ---
+        # Build a lookup: component_name -> task_order (index within this subtask list)
+        name_to_index = {}
+        for i, st in enumerate(subtasks):
+            contract = st.output_contract
+            if isinstance(contract, dict) and "component_name" in contract:
+                name_to_index[contract["component_name"]] = i
+
+        # Now wire up depends_on using the lookup
+        for st in subtasks:
+            contract = st.output_contract
+            if not isinstance(contract, dict):
+                continue
+            comp_name = contract.get("component_name", "")
+            # Find the original ComponentSpec to get its depends_on names
+            matching_comps = [c for c in components if c.name == comp_name]
+            if not matching_comps:
+                continue
+            comp_deps = matching_comps[0].depends_on  # list[str] of component names
+            resolved = []
+            for dep_name in comp_deps:
+                if dep_name in name_to_index:
+                    resolved.append(name_to_index[dep_name])
+                else:
+                    logger.warning(
+                        f"Component '{comp_name}' depends on '{dep_name}' "
+                        f"but no task found for it — dependency dropped"
+                    )
+            if resolved:
+                st.depends_on = sorted(resolved)
+                logger.info(
+                    f"Task {st.task_order} ({comp_name}) depends on tasks {resolved}"
+                )
+```
+
+**Why sorted:** Deterministic ordering for reproducible plans and easier debugging.
+
+**Why warn on missing deps:** If SpecGenerator produces a component that references
+a dependency that was truncated (by the cap-at-5 logic), that's a real planning
+error that should be visible in logs, not silently ignored.
+
+**Verification after this change:**
+```bash
+cd /path/to/project && python -c "
+from planning.hierarchical import HierarchicalPlanner
+from planning.spec_generator import AppSpec, ComponentSpec
+from schemas import TaskSchema
+
+# Simulate a 3-component spec where B depends on A, C depends on A and B
+spec = AppSpec(
+    summary='Test app',
+    features=['test'],
+    components=[
+        ComponentSpec(name='CompA', responsibility='base', output_file='outputs/comp_a.py',
+                      depends_on=[], public_interface='do_a()'),
+        ComponentSpec(name='CompB', responsibility='uses A', output_file='outputs/comp_b.py',
+                      depends_on=['CompA'], public_interface='do_b()'),
+        ComponentSpec(name='CompC', responsibility='uses A and B', output_file='outputs/comp_c.py',
+                      depends_on=['CompA', 'CompB'], public_interface='do_c()'),
+    ],
+    done_criteria=['test passes'],
 )
-from ...storage import save_critique_event, mark_findings_survived
-from ...config import settings
-from .executor import ExecutorAgent
-from .integrator import IntegratorAgent
-from .minimalist import MinimalistAgent
-from .cross_exam import CrossExamination
-from .blue_team import BlueTeamDefense
-from .synthesis import compute_confidence, build_constraint_manifest, BLOCK_THRESHOLD, NOISE_THRESHOLD
-
-class RedTeamCouncil:
-    """
-    5-round adversarial planning review.
-    Drop-in replacement for CritiqueAgent.
-
-    Usage:
-        verdict, tokens = RedTeamCouncil.review(plan, request)
-    """
-
-    @classmethod
-    def review(
-        cls,
-        plan: PlanSchema,
-        request: RequestSchema,
-        cycle: int = 0,
-        session_id: str = None,
-    ) -> tuple[CouncilVerdict, int]:
-        # session_id links original plan + re-plan for Historian
-        if session_id is None:
-            session_id = str(uuid.uuid4())
-
-        total_tokens = 0
-
-        # === ROUND 1: Independent Red Team ===
-        print(f"    [R1] Executor...")
-        exec_findings, t1 = ExecutorAgent.find_issues(plan)
-        print(f"    [R1] Integrator...")
-        integ_findings, t2 = IntegratorAgent.find_issues(plan)
-        print(f"    [R1] Minimalist...")
-        mini_findings, t3 = MinimalistAgent.find_issues(plan)
-        total_tokens += t1 + t2 + t3
-
-        # CRITICAL: Assign global original_index immediately, before any filtering
-        all_r1 = exec_findings + integ_findings + mini_findings
-        for i, f in enumerate(all_r1):
-            f.original_index = i
-
-        cls._log_findings(session_id, plan.plan_id, request.content, cycle, all_r1)
-        print(f"    [R1] {len(all_r1)} total findings")
-
-        if not all_r1:
-            print(f"    [R1] No issues -- approved")
-            return CouncilVerdict(
-                approved=True, confidence_scores={},
-                high_confidence_findings=[], constraint_manifest=None,
-                rounds_used=1, total_tokens=total_tokens, session_id=session_id,
-                all_findings=[], cross_exam_responses=[], blue_team_responses=[],
-            ), total_tokens
-
-        # === ROUND 2: Cross-Examination ===
-        # All three agents review the SAME global all_r1 list
-        # Each prompt filters to "findings not from your agent" in the prompt text
-        print(f"    [R2] Cross-examination...")
-        exec_cross, t4  = CrossExamination.run("executor", all_r1, plan)
-        integ_cross, t5 = CrossExamination.run("integrator", all_r1, plan)
-        mini_cross, t6  = CrossExamination.run("minimalist", all_r1, plan)
-        total_tokens += t4 + t5 + t6
-        all_cross = exec_cross + integ_cross + mini_cross
-
-        cls._log_cross_exam(session_id, plan.plan_id, request.content, cycle, all_cross)
-
-        # Filter: remove findings disputed by >= 1 other agent
-        # (more aggressive than original spec -- reduces noise at cost of some signal)
-        surviving = cls._filter_disputed(all_r1, all_cross, min_disputes=1)
-        print(f"    [R2] {len(surviving)}/{len(all_r1)} findings survived")
-
-        if not surviving:
-            return CouncilVerdict(
-                approved=True, confidence_scores={},
-                high_confidence_findings=[], constraint_manifest=None,
-                rounds_used=2, total_tokens=total_tokens, session_id=session_id,
-                all_findings=all_r1, cross_exam_responses=all_cross, blue_team_responses=[],
-            ), total_tokens
-
-        # === ROUND 3: Blue Team Defense ===
-        print(f"    [R3] Blue Team...")
-        blue_responses, t7 = BlueTeamDefense.run(plan, request, surviving)
-        total_tokens += t7
-
-        cls._log_blue_team(session_id, plan.plan_id, request.content, cycle, blue_responses, surviving)
-
-        # === ROUND 4: Synthesis (deterministic) ===
-        # Uses original_index throughout -- no re-indexing after filtering
-        confidence_scores: dict[int, float] = {}
-        for f in surviving:
-            score = compute_confidence(f, all_r1, all_cross, blue_responses)
-            confidence_scores[f.original_index] = score
-
-        high_confidence = [
-            f for f in surviving
-            if confidence_scores.get(f.original_index, 0) >= BLOCK_THRESHOLD
-        ]
-
-        print(f"    [R4] {len(high_confidence)} high-confidence findings (threshold={BLOCK_THRESHOLD})")
-        cls._log_synthesis(session_id, plan.plan_id, request.content, cycle, surviving, confidence_scores)
-
-        if not high_confidence:
-            return CouncilVerdict(
-                approved=True, confidence_scores=confidence_scores,
-                high_confidence_findings=[], constraint_manifest=None,
-                rounds_used=4, total_tokens=total_tokens, session_id=session_id,
-                all_findings=all_r1, cross_exam_responses=all_cross, blue_team_responses=blue_responses,
-            ), total_tokens
-
-        # === ROUND 5: Constraint Manifest ===
-        manifest = build_constraint_manifest(high_confidence, plan)
-
-        return CouncilVerdict(
-            approved=False, confidence_scores=confidence_scores,
-            high_confidence_findings=high_confidence, constraint_manifest=manifest,
-            rounds_used=5, total_tokens=total_tokens, session_id=session_id,
-            all_findings=all_r1, cross_exam_responses=all_cross, blue_team_responses=blue_responses,
-        ), total_tokens
-
-    @staticmethod
-    def _filter_disputed(
-        findings: list[RedTeamFinding],
-        responses: list[CrossExamResponse],
-        min_disputes: int = 1,
-    ) -> list[RedTeamFinding]:
-        """
-        Remove findings disputed by >= min_disputes other agents.
-        Uses original_index for lookup.
-        Default min_disputes=1: any single dispute removes the finding.
-        """
-        dispute_counts: dict[int, int] = {}
-        for r in responses:
-            if r.verdict == "dispute":
-                dispute_counts[r.finding_index] = dispute_counts.get(r.finding_index, 0) + 1
-        return [f for f in findings if dispute_counts.get(f.original_index, 0) < min_disputes]
-
-    # === Logging helpers ===
-
-    @staticmethod
-    def _log_findings(session_id, plan_id, req_content, cycle, findings):
-        for f in findings:
-            save_critique_event(
-                session_id=session_id, plan_id=plan_id, request_content=req_content,
-                cycle=cycle, round_name=f.agent, agent=f.agent,
-                content=f.description, finding_type=f.finding_type,
-                task_index=f.task_index, severity=f.severity,
-            )
-
-    @staticmethod
-    def _log_cross_exam(session_id, plan_id, req_content, cycle, responses):
-        for r in responses:
-            save_critique_event(
-                session_id=session_id, plan_id=plan_id, request_content=req_content,
-                cycle=cycle, round_name="cross_exam", agent="cross_exam",
-                content=r.reasoning, task_index=r.finding_index, verdict=r.verdict,
-            )
-
-    @staticmethod
-    def _log_blue_team(session_id, plan_id, req_content, cycle, responses, findings):
-        for r in responses:
-            save_critique_event(
-                session_id=session_id, plan_id=plan_id, request_content=req_content,
-                cycle=cycle, round_name="blue_team", agent="blue_team",
-                content=r.rebuttal or "No rebuttal -- finding confirmed",
-                task_index=r.finding_index,
-                verdict="rebut" if r.can_rebut else "concede",
-            )
-
-    @staticmethod
-    def _log_synthesis(session_id, plan_id, req_content, cycle, findings, scores):
-        for f in findings:
-            save_critique_event(
-                session_id=session_id, plan_id=plan_id, request_content=req_content,
-                cycle=cycle, round_name="synthesis", agent="synthesis",
-                content=f.description, finding_type=f.finding_type,
-                task_index=f.task_index, severity=f.severity,
-                confidence_score=scores.get(f.original_index),
-            )
+root_task = TaskSchema(plan_id='test', task_order=0, goal='test app')
+subtasks, tokens = HierarchicalPlanner._decompose_task_from_spec(root_task, spec)
+for st in subtasks:
+    name = st.output_contract['component_name'] if isinstance(st.output_contract, dict) else '?'
+    print(f'Task {st.task_order} ({name}): depends_on={st.depends_on}')
+# Expected:
+# Task 0 (CompA): depends_on=[]
+# Task 1 (CompB): depends_on=[0]
+# Task 2 (CompC): depends_on=[0, 1]
+"
 ```
 
 ---
 
-### 11. `red_team/__init__.py`
+### Change 2: Make `_auto_detect_dependencies` respect existing `depends_on`
+
+**File:** `orchestrator.py`, method `_auto_detect_dependencies` (starts ~line 547)
+
+**Current behavior (the overwrite bug):**
+```python
+@staticmethod
+def _auto_detect_dependencies(plan: PlanSchema):
+    for task in plan.tasks:
+        if task.task_order == 0:
+            continue
+        goal_lower = task.goal.lower()
+        if any(kw in goal_lower for kw in dependency_keywords):
+            task.depends_on = [task.task_order - 1]           # ← OVERWRITES
+        elif task.task_order > 0:
+            task.depends_on = [task.task_order - 1]           # ← OVERWRITES
+```
+
+This unconditionally assigns `depends_on = [task_order - 1]` to every task, which
+means a task that was correctly wired as `depends_on=[0, 2]` by Change 1 would get
+overwritten to `depends_on=[previous_task]`.
+
+**Required change:** Skip tasks that already have `depends_on` populated.
+
+**Exact implementation:**
+
+At the top of the for-loop body, after `if task.task_order == 0: continue`, add:
 
 ```python
-from .council import RedTeamCouncil
+            # Respect dependencies already set by the planner (e.g., spec-driven)
+            if task.depends_on:
+                logger.debug(
+                    f"Task {task.task_order} already has depends_on={task.depends_on}, skipping auto-detect"
+                )
+                continue
+```
 
-__all__ = ["RedTeamCouncil"]
+**This is the single highest-leverage line in this entire ACTIVE.** Without it,
+Change 1 is dead code.
+
+**Verification after this change:**
+```bash
+cd /path/to/project && python -c "
+from schemas import PlanSchema, TaskSchema
+
+plan = PlanSchema(request_id='test', tasks=[
+    TaskSchema(plan_id='t', task_order=0, goal='Write base module'),
+    TaskSchema(plan_id='t', task_order=1, goal='Write handler using the base', depends_on=[0]),
+    TaskSchema(plan_id='t', task_order=2, goal='Write CLI that uses base and handler', depends_on=[0, 1]),
+])
+
+from orchestration.orchestrator import Orchestrator
+Orchestrator._auto_detect_dependencies(plan)
+
+for t in plan.tasks:
+    print(f'Task {t.task_order}: depends_on={t.depends_on}')
+# Expected:
+# Task 0: depends_on=[]
+# Task 1: depends_on=[0]        ← preserved, NOT overwritten to [0]
+# Task 2: depends_on=[0, 1]     ← preserved, NOT overwritten to [1]
+"
 ```
 
 ---
 
-### 12. Orchestrator Changes  (`orchestrator.py`)
+### Change 3: Wire `SubtaskSpec.depends_on` into tasks in the standard decomposition path
+
+**File:** `hierarchical.py`, method `_decompose_task` (the standard/non-spec path, starts ~line 408)
+
+**Current behavior:**
+The LLM returns `SubtaskSpec` objects with `depends_on: list[int]` populated (the
+prompt explicitly asks for it with an example). But the conversion to `TaskSchema`
+at lines 533-541 drops `depends_on`:
 
 ```python
-# Add imports at top (remove CritiqueAgent import):
-from ..planning.red_team.council import RedTeamCouncil
-from ..storage import mark_findings_survived
-# Remove: from ..planning.critic import CritiqueAgent
-
-# Replace Stage 1.5 block entirely:
-
-# === STAGE 1.5: RED TEAM COUNCIL ===
-print(f"\nStage 1.5: Red Team Council")
-
-# session_id persists across re-plan cycles for Historian linking
-import uuid as _uuid
-council_session_id = str(_uuid.uuid4())
-
-council_verdict, council_tokens = RedTeamCouncil.review(
-    plan, request, cycle=0, session_id=council_session_id
-)
-plan.token_usage += council_tokens
-
-if not council_verdict.approved and council_verdict.constraint_manifest:
-    n = len(council_verdict.high_confidence_findings)
-    print(f"\n   {n} blocking issue(s) -- replanning with constraints...")
-
-    plan = self._replan_with_manifest(request, council_verdict.constraint_manifest)
-    plan.token_usage += council_tokens  # approximate
-
-    council_verdict_2, council_tokens_2 = RedTeamCouncil.review(
-        plan, request, cycle=1, session_id=council_session_id
-    )
-    plan.token_usage += council_tokens_2
-
-    # Mark whether first-cycle findings survived into second cycle
-    mark_findings_survived(council_session_id, cycle=0, survived=not council_verdict_2.approved)
-
-    if not council_verdict_2.approved:
-        print(f"   Issues remain after revision -- proceeding with warnings")
-
-save_plan_to_sqlite(plan)
-print(f"   Saved plan after council review")
-
-# Remove _replan_with_critique method -- replaced below
+        subtasks = []
+        for i, spec in enumerate(filtered_specs):
+            task_obj = TaskSchema(
+                plan_id="placeholder",
+                task_order=i,
+                goal=spec.goal,
+                declared_agent=spec.agent_type,
+                # ← spec.depends_on is NEVER mapped to task_obj.depends_on
+            )
+            subtasks.append(task_obj)
 ```
 
-Add `_replan_with_manifest` method to `Orchestrator` class:
+**Required change:** Add `depends_on=spec.depends_on` to the TaskSchema constructor.
+
+**Exact implementation:**
+
+Change the TaskSchema construction to:
 
 ```python
-def _replan_with_manifest(
-    self, request: RequestSchema, manifest: ConstraintManifest
-) -> PlanSchema:
-    """Re-plan with structured constraints. Not freeform feedback."""
-    lines = []
-    for task_idx, c in manifest.task_constraints.items():
-        lines.append(f"- Task {task_idx} must satisfy: {c}")
-    for c in manifest.structural_constraints:
-        lines.append(f"- STRUCTURAL: {c}")
-    for goal in manifest.must_include_tasks:
-        lines.append(f"- MUST INCLUDE A TASK FOR: {goal}")
-    for pair in manifest.must_not_combine:
-        if len(pair) == 2:
-            lines.append(f"- NEVER combine [{pair[0]}] and [{pair[1]}] in one task")
+            task_obj = TaskSchema(
+                plan_id="placeholder",
+                task_order=i,
+                goal=spec.goal,
+                declared_agent=spec.agent_type,
+                depends_on=spec.depends_on,
+            )
+```
 
-    augmented_content = (
-        f"{request.content}\n\n"
-        "HARD PLANNING CONSTRAINTS (non-negotiable, from adversarial review):\n"
-        + "\n".join(lines)
-    )
-    augmented_request = RequestSchema(
-        request_id=request.request_id,
-        content=augmented_content
-    )
-    if settings.USE_HIERARCHICAL_PLANNING:
-        return HierarchicalPlanner.create_plan(augmented_request)
-    else:
-        return PlanningAgent.create_plan(augmented_request)
+**Risk assessment:** This is the change with real behavioral risk. It trusts the
+7B model to populate `SubtaskSpec.depends_on` correctly. If the model returns
+garbage indices (e.g., `depends_on=[5]` when there are only 3 subtasks), the
+execution loop will skip the task (because `plan.tasks[5]` doesn't exist or the
+bounds check at `orchestrator.py:127` — `if dep < len(plan.tasks)` — filters it).
+
+**Add a bounds-check safety net** immediately after the TaskSchema construction:
+
+```python
+            # Clamp depends_on to valid sibling indices
+            task_obj.depends_on = [d for d in task_obj.depends_on if 0 <= d < len(filtered_specs) and d != i]
+```
+
+This ensures:
+- No out-of-bounds indices
+- No self-dependencies
+- No negative indices
+
+**What about removing the sequential fallback in `_auto_detect_dependencies`?**
+Do NOT remove the `elif task.task_order > 0: task.depends_on = [task.task_order - 1]`
+fallback yet. Change 2 already makes it safe (it only fires for tasks where
+`depends_on` is empty). The fallback is correct behavior for tasks that came through
+the standard path when the LLM returned `depends_on=[]` — sequential execution is
+the safe default when no explicit dependency info exists. Removing it would risk
+out-of-order execution for non-spec plans where the 7B model didn't populate
+dependencies. Leave it for a future change after you have evidence the LLM reliably
+populates `depends_on`.
+
+**Verification after this change:**
+```bash
+cd /path/to/project && python -c "
+from schemas import SubtaskSpec
+
+# Simulate what the LLM returns
+specs = [
+    SubtaskSpec(agent_type='file', goal='Read Workouts.csv', depends_on=[]),
+    SubtaskSpec(agent_type='code', goal='Calculate averages', depends_on=[0]),
+    SubtaskSpec(agent_type='file', goal='Save results', depends_on=[1]),
+]
+# Verify depends_on is preserved
+for s in specs:
+    print(f'{s.agent_type}: depends_on={s.depends_on}')
+# This just validates the schema. The real test is an end-to-end run.
+"
 ```
 
 ---
 
-### 13. plan.py Display Updates
+### Change 4: Pass only declared dependencies as context (not all previous tasks)
 
-Replace the Stage 1.5 section:
+**File:** `orchestrator.py`, method `_execute_task_with_retry` (starts ~line 177)
+
+**Current behavior (lines 194-219):**
+Context is built from ALL previous tasks (`t.task_order < task.task_order`),
+regardless of whether the current task actually depends on them. This works but
+floods the 7B model's context window with irrelevant information, increasing the
+chance of attention degradation.
+
+**Required change:** When `task.depends_on` is populated, filter `previous_tasks`
+to only include the declared dependencies. Fall back to "all previous" when
+`depends_on` is empty (backward compatibility with non-spec plans).
+
+**Exact implementation:**
+
+Replace the context-building block (lines 194-219) with:
 
 ```python
-from ai_intern.planning.red_team.council import RedTeamCouncil
+            # Build context from previous tasks (#5 - use data_summary when available)
+            # When depends_on is set, only include declared dependencies (focused context).
+            # When depends_on is empty, include all previous tasks (backward compat).
+            if task.depends_on:
+                relevant_tasks = [
+                    t for t in plan.tasks
+                    if t.task_order in task.depends_on and t.result is not None
+                ]
+            else:
+                relevant_tasks = [
+                    t for t in plan.tasks
+                    if t.task_order < task.task_order and t.result is not None
+                ]
 
-_section("Stage 1.5 -- Red Team Council  (Adversarial Review)")
+            context = {
+                'previous_tasks': [
+                    {
+                        'order': t.task_order,
+                        'goal': t.goal,
+                        'result': t.result,
+                        'status': t.status,
+                        'data_summary': (
+                            t.task_output.data_summary
+                            if t.task_output and t.task_output.data_summary
+                            else None
+                        ),
+                        'file_path': (
+                            t.task_output.file_path
+                            if t.task_output and t.task_output.file_path
+                            else None
+                        ),
+                        'key_values': (
+                            t.task_output.key_values
+                            if t.task_output and t.task_output.key_values
+                            else None
+                        ),
+                    }
+                    for t in relevant_tasks
+                ]
+            }
+```
 
-if len(plan.tasks) < 2:
-    print(f"  Skipped: {len(plan.tasks)} task -- council only runs on 2+ task plans")
+**Why this matters for 7B models:** A 5-component app generates 5 tasks. Task 4
+(the CLI entry point) may only depend on tasks 0 and 3. Without this change, the
+CodingAgent prompt for task 4 includes the full code output of tasks 0, 1, 2, 3 —
+potentially 200+ lines of irrelevant code consuming attention budget. With this
+change, it only sees tasks 0 and 3.
+
+**Verification after this change — TWO tests required:**
+
+**Test A: Spec-driven plan (exercises the `if task.depends_on` branch).**
+```bash
+cd /path/to/project && python -c "
+from schemas import RequestSchema
+from orchestration.orchestrator import Orchestrator
+
+request = RequestSchema(content='Build a simple note-taking app with add, list, and delete')
+orchestrator = Orchestrator(max_retries=1)
+plan = orchestrator.execute_request(request)
+
+print(f'\nPlan status: {plan.status}')
+print(f'Tasks: {len(plan.tasks)}')
+for t in plan.tasks:
+    contract = t.output_contract
+    name = contract.get('component_name', '?') if isinstance(contract, dict) else '?'
+    print(f'  Task {t.task_order} ({name}): depends_on={t.depends_on} status={t.status}')
+"
+```
+
+**Test B: Non-spec plan (verifies backward compatibility).**
+This exercises the full chain: standard decomposition → Change 2's sequential
+fallback → Change 4's context scoping. The critical check is that every non-first
+task receives context from its predecessor (same behavior as before these changes).
+```bash
+cd /path/to/project && python -c "
+from schemas import RequestSchema, PlanSchema, TaskSchema, TaskOutput
+
+# --- Unit test: simulate a 3-task non-spec plan post-Change-2 ---
+# After _auto_detect_dependencies, non-spec tasks with empty depends_on
+# get sequential deps. Verify Change 4 produces the same context as before.
+
+plan = PlanSchema(request_id='test', tasks=[
+    TaskSchema(plan_id='t', task_order=0, goal='Read Workouts.csv',
+               result='date,calories\n2024-01-01,350\n2024-01-02,420',
+               status='validated'),
+    TaskSchema(plan_id='t', task_order=1, goal='Calculate average calories',
+               depends_on=[0],   # set by Change 2 fallback
+               result='def calc(): return 385.0',
+               status='validated'),
+    TaskSchema(plan_id='t', task_order=2, goal='Save summary to file',
+               depends_on=[1],   # set by Change 2 fallback
+               result=None,      # not yet executed
+               status='pending'),
+])
+
+# Simulate the context-building logic from Change 4 for task 2
+task = plan.tasks[2]
+if task.depends_on:
+    relevant = [t for t in plan.tasks if t.task_order in task.depends_on and t.result is not None]
 else:
-    print(f"  Reviewing {len(plan.tasks)}-task plan...")
-    print()
+    relevant = [t for t in plan.tasks if t.task_order < task.task_order and t.result is not None]
 
-    council_verdict, council_tokens = RedTeamCouncil.review(plan, req)
-    plan.token_usage += council_tokens
+context_orders = [t.task_order for t in relevant]
+print(f'Task 2 context includes tasks: {context_orders}')
+assert context_orders == [1], f'Expected [1], got {context_orders}'
 
-    status = "APPROVED" if council_verdict.approved else "REJECTED"
-    print()
-    print(f"  Verdict       : {status}")
-    print(f"  Rounds used   : {council_verdict.rounds_used} / 5")
-    print(f"  Tokens        : {council_tokens:,}")
-    print(f"  R1 findings   : {len(council_verdict.all_findings)}")
+# Also verify task 1 sees task 0
+task1 = plan.tasks[1]
+if task1.depends_on:
+    relevant1 = [t for t in plan.tasks if t.task_order in task1.depends_on and t.result is not None]
+else:
+    relevant1 = [t for t in plan.tasks if t.task_order < task1.task_order and t.result is not None]
 
-    if council_verdict.confidence_scores:
-        print()
-        print(f"  Confidence scores (surviving findings):")
-        for orig_idx, score in sorted(council_verdict.confidence_scores.items()):
-            f = next((x for x in council_verdict.all_findings if x.original_index == orig_idx), None)
-            label = f"{f.agent}/{f.finding_type}" if f else "unknown"
-            filled = int(score * 10)
-            bar = "X" * filled + "." * (10 - filled)
-            blocked = "  [BLOCK]" if score >= 0.65 else ""
-            print(f"    [{orig_idx}] {bar} {score:.2f}  {label}{blocked}")
+context_orders1 = [t.task_order for t in relevant1]
+print(f'Task 1 context includes tasks: {context_orders1}')
+assert context_orders1 == [0], f'Expected [0], got {context_orders1}'
 
-    if council_verdict.high_confidence_findings:
-        print()
-        print(f"  High-confidence issues:")
-        for f in council_verdict.high_confidence_findings:
-            score = council_verdict.confidence_scores.get(f.original_index, 0)
-            print(f"    [{f.original_index}] Task {f.task_index:2d}  {score:.2f}  [{f.finding_type}]")
-            print(f"           {f.description[:80]}...")
-
-    if council_verdict.constraint_manifest:
-        m = council_verdict.constraint_manifest
-        total_constraints = (
-            len(m.task_constraints) + len(m.structural_constraints) +
-            len(m.must_include_tasks) + len(m.must_not_combine)
-        )
-        print()
-        print(f"  Constraint manifest ({total_constraints} constraints):")
-        for tidx, c in m.task_constraints.items():
-            print(f"    Task {tidx}: {c[:80]}...")
-        for c in m.structural_constraints:
-            print(f"    Structural: {c[:80]}...")
-        for g in m.must_include_tasks:
-            print(f"    Must include: {g[:80]}...")
+print('Backward compatibility PASSED: non-spec tasks receive sequential context')
+"
 ```
+
+**Test C (optional but recommended): Edge case — task with empty `depends_on` and
+no sequential fallback.** This can happen if `_auto_detect_dependencies` is skipped
+or if a task is manually constructed. Verifies the `else` branch gives all-previous.
+```bash
+cd /path/to/project && python -c "
+from schemas import PlanSchema, TaskSchema
+
+plan = PlanSchema(request_id='test', tasks=[
+    TaskSchema(plan_id='t', task_order=0, goal='Step A', result='result A', status='validated'),
+    TaskSchema(plan_id='t', task_order=1, goal='Step B', result='result B', status='validated'),
+    TaskSchema(plan_id='t', task_order=2, goal='Step C', depends_on=[],     # explicitly empty
+               result=None, status='pending'),
+])
+
+task = plan.tasks[2]
+if task.depends_on:
+    relevant = [t for t in plan.tasks if t.task_order in task.depends_on and t.result is not None]
+else:
+    relevant = [t for t in plan.tasks if t.task_order < task.task_order and t.result is not None]
+
+context_orders = [t.task_order for t in relevant]
+print(f'Task 2 (empty depends_on) context includes tasks: {context_orders}')
+assert context_orders == [0, 1], f'Expected [0, 1], got {context_orders}'
+print('Empty depends_on fallback PASSED: task sees all previous tasks')
+"
+```
+
+**Why three tests:** Test A validates the new spec-driven path. Test B validates
+that the typical non-spec flow (where Change 2's sequential fallback populates
+`depends_on`) still produces equivalent behavior. Test C validates the true fallback
+edge case where `depends_on` is genuinely empty — this branch rarely fires in
+practice (Change 2 fills it for most tasks), but if it ever does, the task must
+still receive full context rather than zero context.
+
+---
+
+## Do Not Modify
+
+These files are read-only for this change set. If you find yourself needing to edit
+them, stop and document why in your report — it likely means one of the four changes
+above has a design error.
+
+- `schemas.py` — `TaskSchema.depends_on` and `SubtaskSpec.depends_on` already exist
+- `spec_generator.py` — `ComponentSpec.depends_on` already produces the right data
+- `workspace.py` — Already consumes component names correctly
+- `routing.py` — Routing is orthogonal to dependency wiring
+- `validator.py` — Validation is orthogonal to dependency wiring
+- `classifier.py` — Classification is orthogonal to dependency wiring
+- Any file under `red_team/` — Council review is orthogonal
+- `config.py`, `storage.py`, `llm.py` — Infrastructure, no changes needed
+
+---
+
+## Implementation Checklist (for Claude Code)
+
+1. Read this file fully before writing any code.
+2. For each change (1 through 4), in order:
+   a. Read the target method in full — `view` the file, don't rely on memory.
+   b. If the change is already present, note it in the report and skip.
+   c. Implement the change exactly as specified.
+   d. Run the verification command for that change.
+   e. If verification fails, fix before moving to the next change.
+3. After all changes, run the end-to-end test from Change 4's verification.
+4. Report:
+   - Which changes were implemented vs. already present
+   - Output of each verification command
+   - Any unexpected issues encountered
 
 ---
 
 ## Success Criteria
 
-- [ ] `RedTeamCouncil.review()` runs end-to-end without crashing on the color web app example
-- [ ] `original_index` is set on all findings immediately after R1, never changes
-- [ ] All cross-exam and blue-team responses reference global `original_index` correctly
-- [ ] `plan_critique_history` table created on first run
-- [ ] Every round's output is logged to the table with correct `session_id`
-- [ ] `survived_revision` updated after second cycle via `mark_findings_survived`
-- [ ] `warn` findings cannot exceed `WARN_SCORE_CAP` (0.60) -- cannot trigger re-plan
-- [ ] Only `block`-severity findings above 0.65 produce a `ConstraintManifest`
-- [ ] `plan.py` displays confidence bars and constraint manifest correctly
-- [ ] Council short-circuits cleanly at R1 (no issues) or R2 (all disputed)
-- [ ] Old `CritiqueAgent` import removed from orchestrator; `critic.py` preserved
-- [ ] `_replan_with_critique` removed from orchestrator; `_replan_with_manifest` added
-- [ ] `red_team/__init__.py` exports `RedTeamCouncil`
-
----
-
-## Constraints
-
-- DO NOT delete `critic.py`
-- DO NOT modify `HierarchicalPlanner`, `TaskClassifier`, or `SpecGenerator`
-- DO NOT add async/await
-- DO NOT change existing `PlanSchema` or `TaskSchema` field names
-- All `call_ollama_structured` signatures identical to existing usage
-- `ConstraintManifest.must_not_combine` is `list[list[str]]` (not tuple -- JSON compat)
-- `RedTeamFinding.agent` is `Optional[str] = None` in schema (set server-side, not by LLM)
-- `original_index` on `RedTeamFinding` is `Optional[int] = None` (set server-side)
-- Cross-exam passes full `all_r1` list to all three agents -- filtering is in the prompt
-
----
-
-## Key Design Decisions (for reference)
-
-**Why `original_index` instead of list position?**
-Filtering steps (_filter_disputed) remove findings from the list. After filtering,
-positional indices shift. `original_index` is immutable from R1 onward, so all
-cross-exam responses, blue-team responses, and confidence scores stay consistent.
-
-**Why dispute threshold = 1 (not 2)?**
-With 2 reviewing agents per finding, the max dispute count is 2. Using >=2 as
-threshold means a finding needs both reviewers to dispute it -- very hard to reach,
-so most findings survive regardless of quality. threshold=1 is more aggressive
-but produces cleaner signal. Tune back to 2 after seeing first run results if too many
-real findings are being filtered.
-
-**Why warn findings capped below BLOCK_THRESHOLD?**
-Without the cap, accumulated warn scores can exceed 0.65 and trigger a full replan.
-A finding the system itself labeled as non-blocking should never be the sole cause
-of a replan. The cap enforces this at the scoring level, not the filtering level.
-
-**Why session_id instead of plan_id for Historian?**
-A replan generates a new `plan_id`. Without `session_id`, the Historian cannot link
-"original plan that failed council" with "revised plan that passed" -- they look like
-unrelated plans. `session_id` is stable across cycles and is the joining key for
-cross-cycle survival analysis.
-
----
-
-## Historian Query (tomorrow's task -- for reference)
-
-```sql
--- Find recurring failure patterns (high survival rate = planner keeps making this mistake)
-SELECT
-    finding_type,
-    task_index,
-    COUNT(*) as occurrences,
-    AVG(survived_revision) as survival_rate,
-    AVG(confidence_score) as avg_confidence
-FROM plan_critique_history
-WHERE survived_revision IS NOT NULL
-  AND round IN ('executor', 'integrator', 'minimalist')
-GROUP BY finding_type, task_index
-HAVING occurrences >= 2
-ORDER BY survival_rate DESC, occurrences DESC;
-```
+After all four changes:
+- Spec-driven tasks have correct `depends_on` indices (not empty, not prose)
+- `_auto_detect_dependencies` does NOT overwrite planner-set dependencies
+- Standard-path subtasks carry `SubtaskSpec.depends_on` through to `TaskSchema`
+- Context passed to agents is scoped to declared dependencies when available
+- **Backward compatibility:** Non-spec plans (e.g., "Read Workouts.csv and calculate
+  average calories, save summary") produce identical execution behavior to before
+  these changes. Specifically: Change 2's sequential fallback assigns `depends_on=
+  [task_order-1]` to every non-first task with empty `depends_on`, and Change 4
+  scopes context to those sequential deps — which is functionally the same as "all
+  previous tasks" in a linear chain. Tests B and C from Change 4 must both pass.
+- No tasks receive zero context due to an empty `depends_on` unless they are
+  genuinely the first task in the plan (task_order=0)
