@@ -1,4 +1,4 @@
-from ..schemas import TaskSchema, TaskOutput
+from ..schemas import TaskSchema, TaskOutput, OutputContract
 from ..llm import call_ollama_code
 from ..config import settings
 from ..logging_config import get_logger
@@ -54,7 +54,11 @@ class ResearchAgent:
         tokens_used += synth_tokens
 
         # Step 4: Extract structured key-value data from synthesis
-        key_values, kv_tokens = cls._extract_key_values(task.goal, synthesis)
+        # If contract specifies expected_keys, use those for targeted extraction
+        contract_keys = None
+        if isinstance(task.output_contract, OutputContract) and task.output_contract.expected_keys:
+            contract_keys = task.output_contract.expected_keys
+        key_values, kv_tokens = cls._extract_key_values(task.goal, synthesis, contract_keys)
         tokens_used += kv_tokens
 
         # Step 5: Store results
@@ -164,13 +168,28 @@ Do not add information not found in the sources."""
         return synthesis.strip(), tokens
 
     @classmethod
-    def _extract_key_values(cls, goal: str, synthesis: str) -> tuple:
+    def _extract_key_values(cls, goal: str, synthesis: str, expected_keys: list[str] = None) -> tuple:
         """
-        Extract numeric key-value pairs from research synthesis.
+        Extract key-value pairs from research synthesis.
+
+        If expected_keys is provided (from OutputContract), extracts those specific keys.
+        Otherwise falls back to generic numeric extraction.
 
         Returns (dict, tokens_used). Empty dict on failure.
         """
-        prompt = f"""Research goal: {goal}
+        if expected_keys:
+            prompt = f"""Research goal: {goal}
+
+Research findings:
+{synthesis[:2000]}
+
+Extract these specific values from the research text above.
+Keys to extract: {expected_keys}
+
+Return a JSON object with the requested keys. Use null for any key you cannot find.
+Return ONLY the JSON object, nothing else."""
+        else:
+            prompt = f"""Research goal: {goal}
 
 Research findings:
 {synthesis[:1500]}

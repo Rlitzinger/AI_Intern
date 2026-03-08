@@ -7,6 +7,9 @@ Shows:
   - Decomposition / clarification / spec generation (if triggered)
   - Output contract generation (what each task produces)
   - Critique pass (issues found, approval status, any revisions)
+  - Dependency wiring (how depends_on was resolved: spec-driven vs LLM vs auto-detect)
+  - Dependency graph (ASCII DAG, topological order, parallelism opportunities)
+  - Context scoping preview (what each agent sees: focused deps vs all-previous fallback)
   - Final plan summary (tasks, agents, contracts, dependency chain)
 
 Usage:
@@ -580,6 +583,239 @@ else:
                 for v in final_violations:
                     print(f"     - {v}")
                 print(f"   Proceeding with best available plan.")
+
+
+# -----------------------------------------------------------------------
+# DEPENDENCY WIRING
+# Shows how depends_on was resolved for each task and what drove it.
+# Three sources: spec-driven (Change 1), standard decomposition (Change 3),
+# or auto-detect fallback (Change 2 preserves planner-set deps).
+# -----------------------------------------------------------------------
+_section("Stage 2 -- Dependency Wiring  (task.depends_on resolution)")
+
+print(f"  Three dependency sources (checked in priority order):")
+print(f"    1. Spec-driven  : ComponentSpec.depends_on names -> task indices")
+print(f"                      Set by _decompose_task_from_spec (Change 1)")
+print(f"    2. LLM-declared : SubtaskSpec.depends_on indices from decomposition prompt")
+print(f"                      Set by _decompose_task standard path (Change 3)")
+print(f"    3. Auto-detect  : Sequential fallback [task_order - 1]")
+print(f"                      Only fires when depends_on is empty (Change 2 guard)")
+print()
+
+# Simulate _auto_detect_dependencies to show what happened
+# We need to capture what was set BEFORE auto-detect vs AFTER
+# Since the plan already has auto-detect applied, we infer the source.
+has_spec = plan.app_spec is not None
+
+for t in plan.tasks:
+    agent = t.declared_agent or t.suggested_agent or "?"
+    is_spec_task = isinstance(t.output_contract, dict)
+    comp_name = t.output_contract.get("component_name", "?") if is_spec_task else None
+
+    # Determine dependency source
+    if t.task_order == 0:
+        dep_source = "root (no dependencies)"
+        dep_detail = ""
+    elif is_spec_task and t.depends_on:
+        # Spec-driven tasks with non-empty depends_on came from Change 1
+        dep_source = "SPEC-DRIVEN (Change 1)"
+        # Look up which component names these indices map to
+        dep_names = []
+        for d in t.depends_on:
+            dep_task = plan.tasks[d] if d < len(plan.tasks) else None
+            if dep_task and isinstance(dep_task.output_contract, dict):
+                dep_names.append(dep_task.output_contract.get("component_name", f"task[{d}]"))
+            else:
+                dep_names.append(f"task[{d}]")
+        dep_detail = f"resolved from component names: {', '.join(dep_names)}"
+    elif is_spec_task and not t.depends_on:
+        dep_source = "SPEC-DRIVEN (Change 1)"
+        dep_detail = "no component dependencies declared in spec"
+    elif t.depends_on == [t.task_order - 1]:
+        # Sequential dependency — either LLM-declared or auto-detect
+        dep_source = "AUTO-DETECT or LLM (sequential)"
+        dep_detail = f"depends_on=[{t.task_order - 1}] (previous task)"
+    elif t.depends_on:
+        # Non-sequential, non-spec — must be LLM-declared (Change 3)
+        dep_source = "LLM-DECLARED (Change 3)"
+        dep_detail = f"SubtaskSpec.depends_on={t.depends_on}"
+    else:
+        dep_source = "NONE (first task or isolated)"
+        dep_detail = ""
+
+    label = f"[{t.task_order}] [{agent:<8}]"
+    if comp_name:
+        label += f" {comp_name}"
+    else:
+        goal_short = t.goal[:50].replace("\n", " ")
+        label += f" {goal_short}..."
+
+    print(f"  {label}")
+    print(f"      depends_on = {t.depends_on}")
+    print(f"      source     = {dep_source}")
+    if dep_detail:
+        print(f"      detail     = {dep_detail}")
+    print()
+
+# Show the auto-detect guard in action
+if has_spec:
+    planner_set = sum(1 for t in plan.tasks if t.task_order > 0 and isinstance(t.output_contract, dict))
+    auto_set = sum(1 for t in plan.tasks if t.task_order > 0 and not isinstance(t.output_contract, dict))
+    print(f"  Auto-detect guard (Change 2):")
+    print(f"    {planner_set} task(s) had planner-set depends_on -> auto-detect SKIPPED")
+    if auto_set:
+        print(f"    {auto_set} task(s) had empty depends_on -> auto-detect applied sequential fallback")
+    print()
+
+
+# -----------------------------------------------------------------------
+# DEPENDENCY GRAPH
+# ASCII visualization of the task dependency DAG.
+# -----------------------------------------------------------------------
+_section("Dependency Graph  (task DAG)")
+
+if len(plan.tasks) <= 1:
+    print(f"  Single task -- no dependency graph to show.")
+else:
+    # Build adjacency: task -> list of tasks that depend on it
+    dependents = {t.task_order: [] for t in plan.tasks}
+    for t in plan.tasks:
+        for d in t.depends_on:
+            if d in dependents:
+                dependents[d].append(t.task_order)
+
+    # Find roots (no incoming edges) and leaves (no outgoing edges)
+    roots = [t.task_order for t in plan.tasks if not t.depends_on]
+    leaves = [t.task_order for t in plan.tasks if not dependents[t.task_order]]
+
+    print(f"  Roots (no deps): {roots}")
+    print(f"  Leaves (no dependents): {leaves}")
+    print()
+
+    # Print each task with its edges
+    for t in plan.tasks:
+        is_spec_task = isinstance(t.output_contract, dict)
+        comp_name = t.output_contract.get("component_name", "") if is_spec_task else ""
+        agent = t.declared_agent or t.suggested_agent or "?"
+        label = comp_name or t.goal[:35].replace("\n", " ")
+
+        # Incoming edges
+        if t.depends_on:
+            incoming = ", ".join(f"[{d}]" for d in t.depends_on)
+            print(f"  {incoming} ---> [{t.task_order}] {label} ({agent})")
+        else:
+            print(f"  (start) --> [{t.task_order}] {label} ({agent})")
+
+        # Outgoing edges
+        if dependents[t.task_order]:
+            outgoing = ", ".join(f"[{d}]" for d in dependents[t.task_order])
+            print(f"  {'':>14} \\---> feeds {outgoing}")
+
+    print()
+
+    # Topological order (simple Kahn's for display)
+    in_degree = {t.task_order: len(t.depends_on) for t in plan.tasks}
+    queue = [t for t in sorted(in_degree) if in_degree[t] == 0]
+    topo_order = []
+    while queue:
+        node = queue.pop(0)
+        topo_order.append(node)
+        for dep in dependents.get(node, []):
+            in_degree[dep] -= 1
+            if in_degree[dep] == 0:
+                queue.append(dep)
+
+    is_linear = all(
+        plan.tasks[i].depends_on == [i - 1] if i > 0 else True
+        for i in range(len(plan.tasks))
+    )
+    graph_type = "LINEAR CHAIN" if is_linear else "DAG (non-linear)"
+
+    print(f"  Topology     : {graph_type}")
+    print(f"  Topo order   : {' -> '.join(f'[{i}]' for i in topo_order)}")
+
+    # Check for parallelism opportunities
+    depth = {}
+    for node in topo_order:
+        t = plan.tasks[node]
+        if not t.depends_on:
+            depth[node] = 0
+        else:
+            depth[node] = max(depth.get(d, 0) for d in t.depends_on) + 1
+    max_depth = max(depth.values()) if depth else 0
+    if max_depth + 1 < len(plan.tasks):
+        print(f"  Critical path: {max_depth + 1} steps (vs {len(plan.tasks)} tasks)")
+        print(f"  Parallelism  : {len(plan.tasks) - (max_depth + 1)} task(s) could run in parallel")
+    else:
+        print(f"  Critical path: {max_depth + 1} steps (fully sequential)")
+
+
+# -----------------------------------------------------------------------
+# CONTEXT SCOPING PREVIEW
+# Shows what context each task would receive during execution (Change 4).
+# -----------------------------------------------------------------------
+_section("Context Scoping Preview  (what each agent sees at execution time)")
+
+print(f"  Change 4 logic:")
+print(f"    if task.depends_on is non-empty:")
+print(f"      -> context = ONLY declared dependencies (focused)")
+print(f"    else:")
+print(f"      -> context = ALL previous tasks (backward compat fallback)")
+print()
+
+for t in plan.tasks:
+    agent = t.declared_agent or t.suggested_agent or "?"
+    is_spec_task = isinstance(t.output_contract, dict)
+    comp_name = t.output_contract.get("component_name", "") if is_spec_task else ""
+    label = comp_name or t.goal[:40].replace("\n", " ")
+
+    if t.task_order == 0:
+        print(f"  [{t.task_order}] {label} ({agent})")
+        print(f"      context: (none -- first task)")
+        print()
+        continue
+
+    if t.depends_on:
+        branch = "depends_on is set -> FOCUSED context"
+        relevant_orders = t.depends_on
+    else:
+        branch = "depends_on is empty -> ALL previous tasks"
+        relevant_orders = list(range(t.task_order))
+
+    relevant_labels = []
+    for d in relevant_orders:
+        if d < len(plan.tasks):
+            dt = plan.tasks[d]
+            dt_spec = isinstance(dt.output_contract, dict)
+            dt_name = dt.output_contract.get("component_name", "") if dt_spec else ""
+            dt_label = dt_name or dt.goal[:30].replace("\n", " ")
+            relevant_labels.append(f"[{d}] {dt_label}")
+
+    print(f"  [{t.task_order}] {label} ({agent})")
+    print(f"      branch : {branch}")
+    print(f"      sees   : {', '.join(f'[{d}]' for d in relevant_orders)}")
+    for rl in relevant_labels:
+        print(f"        - {rl}")
+
+    # For spec-driven tasks, also show workspace context injection
+    if is_spec_task and t.depends_on:
+        # Look up component deps from spec
+        comp_deps = []
+        if plan.app_spec:
+            for c in plan.app_spec.get("components", []):
+                if c["name"] == comp_name:
+                    comp_deps = c.get("depends_on", [])
+                    break
+        if comp_deps:
+            print(f"      workspace: imports from {', '.join(comp_deps)}")
+            print(f"        -> sys.path.insert(0, workspace_root)")
+            for cd in comp_deps:
+                # Find output_file for dep
+                for c2 in plan.app_spec.get("components", []):
+                    if c2["name"] == cd:
+                        mod = c2.get("output_file", "").replace("outputs/", "").replace(".py", "")
+                        print(f"        -> from {mod} import {cd}")
+    print()
 
 
 # -----------------------------------------------------------------------

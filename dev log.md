@@ -121,7 +121,7 @@
 - can used constrained decoding and use outlines to pass strict syntax in the llm
 - honestly the hardest part so far was this. just getting the system in check
 
-# 3/4/2025
+# 3/4/2026
 - did a lot more work on the planner
 - added in constrained decoding for planning output to pick specific agents to use
 - added a better classification of the planner
@@ -130,3 +130,7 @@
 - added a critiqueagent and output contract
 - updated the plan.py to better show details of what happened during the planning phase, and the thinking/reasoning
 - added a round of critique with a red team/blue team
+
+# 3/6?/2026
+- Update planning phase to have clear specs and output contracts at each step
+- 

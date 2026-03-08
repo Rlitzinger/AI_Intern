@@ -39,13 +39,6 @@ class DecompositionResult(BaseModel):
         return coerced
 
 
-class ContractResult(BaseModel):
-    """LLM response for output contract generation."""
-    output_type: str  # validated against allowed literals after
-    output_format: str
-    required_by_tasks: list[int]
-
-
 class ClarificationResult(BaseModel):
     """LLM response schema for task clarification."""
     clarified_goal: str
@@ -336,74 +329,24 @@ class HierarchicalPlanner:
     @classmethod
     def _generate_contracts(cls, tasks: list[TaskSchema]) -> tuple[list[TaskSchema], int]:
         """
-        Generate output contracts for a list of tasks.
-        Called after decomposition, before returning leaf tasks.
-        Only runs when there are 2+ tasks (single tasks don't need contracts).
-        Skips tasks that already have a spec-driven dict output_contract.
+        Fill in required_by_tasks cross-references. No LLM call needed.
+        Contracts are already set from the decomposer's produces/expected_keys.
 
         Returns:
-            tuple: (tasks_with_contracts, tokens_used)
+            tuple: (tasks_with_contracts, tokens_used=0)
         """
         if len(tasks) < 2:
             return tasks, 0
 
-        task_descriptions = "\n".join([
-            f"Task {t.task_order}: {t.goal}" for t in tasks
-        ])
-
-        total_tokens = 0
-        valid_types = ["python_code", "prose", "structured_data", "file_path", "none"]
-
         for task in tasks:
-            # Skip spec-driven tasks that already have a dict output_contract
-            if isinstance(task.output_contract, dict):
-                continue
+            if isinstance(task.output_contract, OutputContract):
+                # Find which downstream tasks depend on this one
+                task.output_contract.required_by_tasks = [
+                    t.task_order for t in tasks
+                    if task.task_order in t.depends_on
+                ]
 
-            prompt = f"""All tasks in this plan:
-{task_descriptions}
-
-For Task {task.task_order}: "{task.goal}"
-
-What does this task produce?
-
-output_type options:
-- "python_code": task generates Python functions/scripts
-- "prose": task generates text (research summaries, analysis, descriptions)
-- "structured_data": task generates parseable data (JSON, CSV, key-value pairs)
-- "file_path": task writes a file and returns the path string
-- "none": task has no meaningful output for downstream tasks
-
-output_format: Describe specifically what the output looks like.
-  python_code example: "function calculate_macros(grams: float) -> dict"
-  prose example: "paragraph summary with cited sources"
-  structured_data example: "dict with keys: protein_g, fat_g, carbs_g as floats"
-  file_path example: "path string like outputs/2024-01-01_summary.txt"
-
-required_by_tasks: Which task numbers (by task_order) consume this output?
-  Look at the other tasks - which ones depend on or reference this task's result?
-
-Return JSON with output_type, output_format, required_by_tasks."""
-
-            result, tokens = call_ollama_structured(
-                model=cls.model,
-                prompt=prompt,
-                system="You are a software architect. Specify exact data contracts between system components. Be precise about types and formats.",
-                response_schema=ContractResult,
-                temperature=0.1
-            )
-            total_tokens += tokens
-
-            output_type = result.output_type if result.output_type in valid_types else "prose"
-
-            task.output_contract = OutputContract(
-                output_type=output_type,
-                output_format=result.output_format,
-                required_by_tasks=result.required_by_tasks
-            )
-
-            print(f"      Task {task.task_order} contract: {output_type} -- {result.output_format[:60]}...")
-
-        return tasks, total_tokens
+        return tasks, 0  # Zero tokens -- purely deterministic
 
     @classmethod
     def _decompose_task(
@@ -450,12 +393,6 @@ DECOMPOSITION RULES:
 5. [code] tasks CANNOT read files - the [file] agent must read first and pass results via context
 6. Keep subtask goals rich and descriptive - the agent needs to understand what to do
 
-GOOD example:
-Task: "Read Workouts.csv and calculate average calories, save summary"
--> subtask 0: agent=file, goal="Read Workouts.csv and return all rows with date, calories, duration columns", input_files=["Workouts.csv"]
--> subtask 1: agent=code, goal="Calculate the average calories burned per workout from the CSV data passed in context. Return a formatted summary string.", depends_on=[0]
--> subtask 2: agent=file, goal="Save the workout analysis summary from context to outputs/workout_summary.txt", output_file="workout_summary.txt", depends_on=[1]
-
 BAD example (never do this):
 -> subtask 0: agent=research, goal="Research how to use pandas to read CSV files"   <- hallucinated
 -> subtask 1: agent=code, goal="Read Workouts.csv and calculate average"             <- code can't read files
@@ -466,6 +403,8 @@ Return a JSON object with a 'subtasks' array. Each subtask must have:
 - input_files: list of filenames from user_data/ (only for file tasks that read)
 - output_file: filename for outputs/ (only for file tasks that write), or null
 - depends_on: list of subtask indices this depends on (empty if no dependencies)
+- produces: what type of output ("structured_data", "prose", "file_path", "python_code")
+- expected_keys: list of key names the output must contain (empty list if produces is "prose" or "python_code")
 
 Example JSON:
 {{
@@ -475,21 +414,27 @@ Example JSON:
       "goal": "Read Workouts.csv and return all workout records with date, calories burned, and duration",
       "input_files": ["Workouts.csv"],
       "output_file": null,
-      "depends_on": []
+      "depends_on": [],
+      "produces": "structured_data",
+      "expected_keys": ["column_names", "row_count", "rows"]
     }},
     {{
       "agent_type": "code",
       "goal": "Using the workout records from context, calculate average calories burned per session and format as a readable summary",
       "input_files": [],
       "output_file": null,
-      "depends_on": [0]
+      "depends_on": [0],
+      "produces": "structured_data",
+      "expected_keys": ["average_calories", "total_workouts", "summary"]
     }},
     {{
       "agent_type": "file",
       "goal": "Save the workout summary from context to outputs/workout_summary.txt",
       "input_files": [],
       "output_file": "workout_summary.txt",
-      "depends_on": [1]
+      "depends_on": [1],
+      "produces": "file_path",
+      "expected_keys": ["file_path"]
     }}
   ]
 }}
@@ -529,8 +474,9 @@ Example JSON:
         if len(filtered_specs) < len(result.subtasks):
             logger.warning(f"Filtered {len(result.subtasks) - len(filtered_specs)} hallucinated task(s)")
 
-        # Convert SubtaskSpec objects to TaskSchema with declared_agent
+        # Convert SubtaskSpec objects to TaskSchema with declared_agent + OutputContract
         subtasks = []
+        valid_output_types = {"python_code", "prose", "structured_data", "file_path", "none"}
         for i, spec in enumerate(filtered_specs):
             task_obj = TaskSchema(
                 plan_id="placeholder",
@@ -541,6 +487,17 @@ Example JSON:
             )
             # Clamp depends_on to valid sibling indices
             task_obj.depends_on = [d for d in task_obj.depends_on if 0 <= d < len(filtered_specs) and d != i]
+
+            # Build OutputContract from SubtaskSpec output declarations
+            if spec.produces:
+                output_type = spec.produces if spec.produces in valid_output_types else "prose"
+                task_obj.output_contract = OutputContract(
+                    output_type=output_type,
+                    output_format=f"key_values with keys: {', '.join(spec.expected_keys)}" if spec.expected_keys else "free-form",
+                    required_by_tasks=[],  # Filled in by _generate_contracts
+                    expected_keys=spec.expected_keys or [],
+                )
+
             subtasks.append(task_obj)
 
         return subtasks, tokens

@@ -1,4 +1,4 @@
-from ..schemas import RequestSchema, PlanSchema, TaskSchema, TaskOutput, CritiqueResult, ConstraintManifest
+from ..schemas import RequestSchema, PlanSchema, TaskSchema, TaskOutput, OutputContract, CritiqueResult, ConstraintManifest
 from ..storage import save_plan_to_sqlite, mark_findings_survived
 from .routing import TaskRouter
 from ..planning.planner import PlanningAgent
@@ -158,9 +158,6 @@ class Orchestrator:
             logger.info(f"Done criteria: {'; '.join(spec.get('done_criteria', []))}")
             logger.info("==========================")
 
-        # Auto-detect dependencies (#19)
-        self._auto_detect_dependencies(plan)
-
         # Preserve original goals (#9)
         for task in plan.tasks:
             if not task.original_goal:
@@ -268,7 +265,17 @@ class Orchestrator:
                     {
                         'order': t.task_order,
                         'goal': t.goal,
-                        'result': t.result,
+                        # Prefer key_values over raw result — suppress result when key_values present
+                        'key_values': (
+                            t.task_output.key_values
+                            if t.task_output and t.task_output.key_values
+                            else None
+                        ),
+                        'result': (
+                            t.result
+                            if not (t.task_output and t.task_output.key_values)
+                            else None
+                        ),
                         'status': t.status,
                         'data_summary': (
                             t.task_output.data_summary
@@ -278,11 +285,6 @@ class Orchestrator:
                         'file_path': (
                             t.task_output.file_path
                             if t.task_output and t.task_output.file_path
-                            else None
-                        ),
-                        'key_values': (
-                            t.task_output.key_values
-                            if t.task_output and t.task_output.key_values
                             else None
                         ),
                     }
@@ -344,6 +346,20 @@ class Orchestrator:
 
             # Check if successful
             if task.status == "validated":
+                # Contract validation — check output has required keys
+                missing_keys = self._validate_contract(task)
+                if missing_keys and attempt < self.max_retries:
+                    logger.warning(f"Contract violation: missing keys {missing_keys}")
+                    task.error_history.append({
+                        'attempt': attempt + 1,
+                        'error': f"Output missing required keys: {missing_keys}",
+                        'test_code': None,
+                        'category': 'contract_violation',
+                    })
+                    task.status = "pending"
+                    attempt += 1
+                    continue
+
                 # For code tasks that compute results, execute and capture output (#22)
                 task_type = TaskRouter.classify_task(task)
                 if task_type == "code":
@@ -531,6 +547,27 @@ class Orchestrator:
             return completed_tasks[-1].result or "Plan completed."
 
     @staticmethod
+    def _validate_contract(task: TaskSchema) -> list[str]:
+        """
+        Check that task output matches its OutputContract.
+        Returns list of missing keys (empty = valid).
+        """
+        contract = task.output_contract
+        if not isinstance(contract, OutputContract):
+            return []  # No contract to validate (spec-driven dict or no contract)
+        if not contract.expected_keys:
+            return []  # Contract doesn't specify keys
+
+        if not task.task_output or not task.task_output.key_values:
+            return contract.expected_keys  # All keys missing
+
+        produced_keys = set(task.task_output.key_values.keys())
+        expected_keys = set(contract.expected_keys)
+        missing = expected_keys - produced_keys
+
+        return list(missing)
+
+    @staticmethod
     def _try_execute_code(task: TaskSchema):
         """Try to execute validated code and capture stdout as execution result (#22)."""
         if not task.result:
@@ -580,6 +617,16 @@ class Orchestrator:
                 if not task.task_output:
                     task.task_output = TaskOutput(output_type="code", raw_result=task.result)
                 task.task_output.data_summary = execution_output
+
+                # Try parsing stdout as JSON for key_values
+                import json as _json
+                try:
+                    parsed = _json.loads(execution_output)
+                    if isinstance(parsed, dict):
+                        task.task_output.key_values = parsed
+                        logger.info(f"Parsed {len(parsed)} key-value pairs from code output")
+                except _json.JSONDecodeError:
+                    pass  # stdout wasn't JSON — data_summary already set
         except (subprocess.TimeoutExpired, Exception) as e:
             logger.debug(f"Code execution skipped: {e}")
         finally:
@@ -614,33 +661,3 @@ class Orchestrator:
         else:
             return PlanningAgent.create_plan(augmented_request)
 
-    @staticmethod
-    def _auto_detect_dependencies(plan: PlanSchema):
-        """Auto-detect task dependencies based on goal text (#19)."""
-        dependency_keywords = [
-            "previous", "results", "from task", "above", "earlier",
-            "using the", "from the", "the research", "the data",
-            "the code", "the analysis", "the summary",
-        ]
-
-        for task in plan.tasks:
-            if task.task_order == 0:
-                continue  # First task has no dependencies
-
-            # Respect dependencies already set by the planner (e.g., spec-driven)
-            if task.depends_on:
-                logger.debug(
-                    f"Task {task.task_order} already has depends_on={task.depends_on}, skipping auto-detect"
-                )
-                continue
-
-            goal_lower = task.goal.lower()
-
-            # Check if goal references previous task output
-            if any(kw in goal_lower for kw in dependency_keywords):
-                task.depends_on = [task.task_order - 1]
-                logger.debug(f"Task {task.task_order} depends on Task {task.task_order - 1}")
-            elif task.task_order > 0:
-                # For sequential plans, assume each task depends on the previous
-                task.depends_on = [task.task_order - 1]
-                logger.debug(f"Task {task.task_order} sequential dependency on Task {task.task_order - 1}")

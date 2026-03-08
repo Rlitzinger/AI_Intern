@@ -1,4 +1,4 @@
-from ..schemas import TaskSchema, TaskOutput
+from ..schemas import TaskSchema, TaskOutput, OutputContract
 from ..config import settings
 from ..logging_config import get_logger
 from datetime import datetime, timezone
@@ -222,6 +222,28 @@ class FileAgent:
                 f"File path: {csv_info['file_path']}"
             )
 
+        # Populate key_values from contract if present
+        contract = task.output_contract
+        if isinstance(contract, OutputContract) and contract.expected_keys:
+            key_values = {}
+            csv_info = metadata.get("csv_info", {})
+            if "column_names" in contract.expected_keys and task_output.column_names:
+                key_values["column_names"] = task_output.column_names
+            if "row_count" in contract.expected_keys and task_output.row_count is not None:
+                key_values["row_count"] = task_output.row_count
+            if "rows" in contract.expected_keys and csv_info:
+                # Re-read rows as list of dicts for structured downstream consumption
+                with open(full_path, 'r', encoding='utf-8-sig') as f:
+                    reader = csv.DictReader(f)
+                    key_values["rows"] = list(reader)
+            if "file_path" in contract.expected_keys:
+                key_values["file_path"] = str(full_path)
+            # Set any remaining expected keys to None
+            for k in contract.expected_keys:
+                if k not in key_values:
+                    key_values[k] = None
+            task_output.key_values = key_values
+
         task.task_output = task_output
 
         result = [
@@ -250,14 +272,14 @@ class FileAgent:
             if filename and filename.endswith('.py'):
                 prev_task = context['previous_tasks'][-1]
                 if prev_task['status'] in ['validated', 'complete']:
-                    content = prev_task['result']
+                    content = prev_task.get('result') or self._key_values_as_text(prev_task)
                     logger.info(f"Using code from Task {prev_task['order']} (detected .py extension)")
 
             elif any(keyword in goal_lower for keyword in ['previous', 'from task', 'research', 'result', 'above', 'earlier',
                                                             'calculator', 'code', 'script', 'function', 'summary', 'analysis']):
                 prev_task = context['previous_tasks'][-1]
                 if prev_task['status'] in ['validated', 'complete']:
-                    content = prev_task['result']
+                    content = prev_task.get('result') or self._key_values_as_text(prev_task)
                     logger.info(f"Using result from Task {prev_task['order']}")
                 else:
                     logger.warning(f"Previous task (Task {prev_task['order']}) failed with status: {prev_task['status']}")
@@ -273,6 +295,23 @@ class FileAgent:
                 logger.info("Detected Python code, using .py extension")
 
         output_path = cls.write_output(filename, content)
+
+        # Populate key_values for write tasks
+        contract = task.output_contract
+        if isinstance(contract, OutputContract) and contract.expected_keys:
+            key_values = {}
+            if "file_path" in contract.expected_keys:
+                key_values["file_path"] = output_path
+            for k in contract.expected_keys:
+                if k not in key_values:
+                    key_values[k] = None
+            task.task_output = TaskOutput(
+                output_type="file_path",
+                raw_result=f"Wrote output to: {output_path}",
+                file_path=output_path,
+                key_values=key_values,
+            )
+
         return f"Wrote output to: {output_path}"
 
     @classmethod
@@ -295,6 +334,17 @@ class FileAgent:
                 return csvs[0]
 
         return None
+
+    @staticmethod
+    def _key_values_as_text(prev_task: dict) -> Optional[str]:
+        """Convert key_values dict to readable text for file writing."""
+        kv = prev_task.get('key_values')
+        if not kv:
+            return prev_task.get('data_summary')
+        lines = []
+        for k, v in kv.items():
+            lines.append(f"{k}: {v}")
+        return "\n".join(lines)
 
     @staticmethod
     def _extract_filename(goal: str) -> Optional[str]:

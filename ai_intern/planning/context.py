@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from ..config import settings
+from typing import Optional
 
 
 AGENT_ROSTER = {
@@ -75,3 +76,34 @@ class PlanningContext:
             lines.append(f"  [{agent_type}] {info['name']}: {info['description']}")
 
         return "\n".join(lines)
+
+
+def format_context_for_prompt(previous_tasks: list[dict]) -> str:
+    """Format previous task outputs for agent consumption.
+
+    When key_values are present, renders them as named variables.
+    Otherwise falls back to data_summary or raw result.
+    """
+    if not previous_tasks:
+        return ""
+
+    lines = ["INPUT FROM PREVIOUS TASKS:"]
+    for t in previous_tasks:
+        lines.append(f"\n--- Task {t['order']} ({t['goal'][:60]}) ---")
+
+        if t.get('key_values'):
+            for k, v in t['key_values'].items():
+                if isinstance(v, list) and len(v) > 5:
+                    lines.append(f"  {k} = [{len(v)} items, first 3: {v[:3]}]")
+                elif isinstance(v, str) and len(v) > 200:
+                    lines.append(f"  {k} = {v[:200]}...")
+                else:
+                    lines.append(f"  {k} = {v}")
+        elif t.get('data_summary'):
+            lines.append(f"  Summary: {t['data_summary'][:300]}")
+        elif t.get('result'):
+            lines.append(f"  Result: {t['result'][:300]}")
+        elif t.get('file_path'):
+            lines.append(f"  File: {t['file_path']}")
+
+    return "\n".join(lines)

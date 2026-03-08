@@ -1,5 +1,6 @@
 from ..schemas import TaskSchema, TaskOutput
 from ..llm import call_ollama_code
+from ..planning.context import format_context_for_prompt
 from ..config import settings
 from ..logging_config import get_logger
 from ..execution.file import FileAgent
@@ -93,15 +94,11 @@ CRITICAL RULES:
         """Build prompt for analysis code generation."""
         parts = []
 
-        # Add data context from previous tasks
+        # Add data context from previous tasks — uses structured format when key_values available
         if context and context.get("previous_tasks"):
-            for prev in context["previous_tasks"]:
-                if prev.get("data_summary"):
-                    parts.append(f"Available data: {prev['data_summary']}\n")
-                if prev.get("file_path"):
-                    parts.append(f"Data file path: {prev['file_path']}\n")
-                elif prev.get("result"):
-                    parts.append(f"Previous result:\n{prev['result'][:500]}\n")
+            formatted = format_context_for_prompt(context["previous_tasks"])
+            if formatted:
+                parts.append(formatted + "\n")
 
         # If no file context, check if we can find files from the goal
         if not parts:

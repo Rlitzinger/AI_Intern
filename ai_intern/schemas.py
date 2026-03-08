@@ -13,6 +13,7 @@ class OutputContract(BaseModel):
     output_type: Literal["python_code", "prose", "structured_data", "file_path", "none"]
     output_format: str  # e.g. "dict with keys: protein_g, fat_g as floats"
     required_by_tasks: list[int] = []  # task_order values that consume this output
+    expected_keys: list[str] = []  # Explicit key names this task must produce in TaskOutput.key_values
 
 
 class CritiqueIssue(BaseModel):
@@ -48,6 +49,8 @@ class SubtaskSpec(BaseModel):
     input_files: list[str] = []         # Files from user_data/ this task needs (must exist)
     output_file: Optional[str] = None   # File this task writes to outputs/ (if any)
     depends_on: list[int] = []          # Indices of subtasks this depends on (0-indexed within siblings)
+    produces: Optional[str] = None      # Output type: "structured_data", "prose", "file_path", "python_code"
+    expected_keys: list[str] = []       # Key names this task must put in TaskOutput.key_values
 
 
 class TaskOutput(BaseModel):

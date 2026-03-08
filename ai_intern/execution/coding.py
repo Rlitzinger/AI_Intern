@@ -1,5 +1,6 @@
-from ..schemas import TaskSchema
+from ..schemas import TaskSchema, OutputContract
 from ..llm import call_ollama_code, estimate_tokens, truncate_to_token_budget
+from ..planning.context import format_context_for_prompt
 from ..config import settings
 from ..logging_config import get_logger
 from datetime import datetime, timezone
@@ -41,29 +42,12 @@ Your response should start directly with Python code (imports or function defini
         lib_block = ErrorClassifier.get_available_libraries_block()
         prompt_parts.append(f"{lib_block}\n\n")
 
-        # Add context if available (#5 - prefer data_summary over raw result)
+        # Add context if available — uses format_context_for_prompt for structured key_values
         if context and context.get('previous_tasks'):
-            prompt_parts.append("CONTEXT FROM PREVIOUS TASKS:\n")
-            for prev_task in context['previous_tasks']:
-                prompt_parts.append(f"Task {prev_task['order']}: {prev_task['goal']}\n")
-
-                # Prefer compact data_summary over raw result
-                if prev_task.get('data_summary'):
-                    prompt_parts.append(f"Data: {prev_task['data_summary']}\n")
-                    if prev_task.get('file_path'):
-                        prompt_parts.append(f"File path: {prev_task['file_path']}\n")
-                elif prev_task.get('result'):
-                    result_preview = prev_task['result'][:500]
-                    prompt_parts.append(f"Result:\n{result_preview}\n")
-
-                # Add structured key-value data if available
-                if prev_task.get('key_values'):
-                    kv = prev_task['key_values']
-                    kv_lines = [f"  {k}: {v}" for k, v in kv.items()]
-                    prompt_parts.append("Structured data from research:\n" + "\n".join(kv_lines) + "\n")
-                    prompt_parts.append("Use these exact values in your code.\n")
-
-            prompt_parts.append("Use the above information when writing your code.\n\n")
+            formatted = format_context_for_prompt(context['previous_tasks'])
+            if formatted:
+                prompt_parts.append(formatted + "\n")
+                prompt_parts.append("Use the above information when writing your code.\n\n")
 
         # Inject workspace context for app-scale tasks with component dependencies
         if context and context.get('workspace_context'):
@@ -87,6 +71,17 @@ Your response should start directly with Python code (imports or function defini
             max_attempts = len(context['error_history']) + 1  # rough estimate
             correction = CodingAgent._build_correction_prompt(latest)
             prompt_parts.append(correction)
+
+        # Add contract output requirement if expected_keys specified
+        if isinstance(task.output_contract, OutputContract) and task.output_contract.expected_keys:
+            keys = task.output_contract.expected_keys
+            keys_example = ', '.join(repr(k) + ': value' for k in keys)
+            prompt_parts.append(
+                f"\nOUTPUT REQUIREMENT: Your code must end with a print statement that outputs "
+                f"a JSON object with these exact keys: {keys}\n"
+                f"Example: print(json.dumps({{{keys_example}}}))\n"
+                f"Import json at the top of your code.\n"
+            )
 
         # Add the main task
         prompt_parts.append(f"Task: {task.goal}\n")
